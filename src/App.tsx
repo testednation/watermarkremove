@@ -33,6 +33,8 @@ import {
   TrendingDown,
   HardDrive,
   PenLine,
+  HelpCircle,
+  FileDown,
 } from 'lucide-react';
 import JSZip from 'jszip';
 import {
@@ -50,7 +52,15 @@ import { PWAInstallButton } from './components/PWAInstallButton';
 import { useOnlineStatus } from './hooks/useOnlineStatus';
 import { BulkCropModal } from './components/BulkCropModal';
 import { BatchRenameModal } from './components/BatchRenameModal';
-import { CropParameters, calculateCropRect, cropImageData } from './lib/cropEngine';
+import { KeyboardShortcutsModal } from './components/KeyboardShortcutsModal';
+import { SimpleModeWorkspace } from './components/SimpleModeWorkspace';
+import { ExportPresetsDropdown } from './components/ExportPresetsDropdown';
+import {
+  CropParameters,
+  calculateCropRect,
+  cropImageData,
+  analyzeAutoCropMargins,
+} from './lib/cropEngine';
 import { optimizeCleanedImage, OptimizeFormat, formatBytes, estimateQueueSizes } from './lib/optimizer';
 import {
   computeReconstructionQuality,
@@ -102,6 +112,7 @@ function imageDataToDataUrl(imgData: ImageData): string {
 export default function App() {
   const isOnline = useOnlineStatus();
   const [isDark, setIsDark] = useState(true);
+  const [isSimpleMode, setIsSimpleMode] = useState<boolean>(true);
 
   // Queue & active image state
   const [queue, setQueue] = useState<QueueItem[]>([]);
@@ -139,9 +150,12 @@ export default function App() {
   const [comparePosition, setComparePosition] = useState<number>(52);
   const [showZoneBoxes, setShowZoneBoxes] = useState<boolean>(true);
   const [showResetConfirmModal, setShowResetConfirmModal] = useState<boolean>(false);
+  const [showBatchResetConfirmModal, setShowBatchResetConfirmModal] = useState<boolean>(false);
   const [showBulkCropModal, setShowBulkCropModal] = useState<boolean>(false);
   const [showBatchRenameModal, setShowBatchRenameModal] = useState<boolean>(false);
+  const [showShortcutsModal, setShowShortcutsModal] = useState<boolean>(false);
   const [isBulkCropping, setIsBulkCropping] = useState<boolean>(false);
+  const [isExportingIndividually, setIsExportingIndividually] = useState<boolean>(false);
   const [smartOptimize, setSmartOptimize] = useState<boolean>(true);
   const [optimizeFormat, setOptimizeFormat] = useState<OptimizeFormat>('webp');
   const [optimizeQuality, setOptimizeQuality] = useState<number>(0.88);
@@ -203,6 +217,20 @@ export default function App() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const activeItem = queue.find((item) => item.id === activeId) || queue[0] || null;
+  const [autoCropTriggerToken, setAutoCropTriggerToken] = useState<number>(0);
+
+  // Analyze active image periphery for empty margins, consistent edge noise, and non-content bands
+  const autoCropSuggestion = useMemo(() => {
+    if (!activeItem) return null;
+    return analyzeAutoCropMargins(activeItem.originalData, activeItem.zones);
+  }, [activeItem]);
+
+  // Open Bulk Crop modal pre-populated with suggested Auto-Crop non-content margin parameters
+  const handleSuggestAutoCrop = useCallback(() => {
+    if (!activeItem) return;
+    setAutoCropTriggerToken((prev) => prev + 1);
+    setShowBulkCropModal(true);
+  }, [activeItem]);
 
   // Real-time file size reduction & savings estimation across current queue selection
   const savingsEstimation = useMemo(() => {
@@ -597,6 +625,57 @@ export default function App() {
     }
   }, [activeTargetQueue, isBatchProcessing, isZipping, inpaintMethod]);
 
+  // Number of target queued items that have active masks, detected zones, or undo/redo stacks that can be reset
+  const batchResettableCount = useMemo(() => {
+    return activeTargetQueue.filter(
+      (item) => item.coveragePercent > 0 || item.undoStack.length > 0 || item.redoStack.length > 0
+    ).length;
+  }, [activeTargetQueue]);
+
+  // Reset All: Clears masks, detection zones, and undo/redo stacks across selected items
+  const executeBatchReset = useCallback(() => {
+    const targetIdSet = new Set(activeTargetQueue.map((item) => item.id));
+
+    setQueue((prev) =>
+      prev.map((item) => {
+        if (!targetIdSet.has(item.id)) return item;
+        const blankMask = new Uint8Array(item.width * item.height);
+        const quality = computeReconstructionQuality(item.originalData, item.originalData, blankMask);
+        return {
+          ...item,
+          mask: blankMask,
+          undoStack: [],
+          redoStack: [],
+          zones: [],
+          coveragePercent: 0,
+          cleanedData: item.originalData,
+          cleanedUrl: item.originalUrl,
+          status: 'cleaned',
+          processingMs: 0,
+          quality,
+        };
+      })
+    );
+
+    setBatchProgress({
+      active: true,
+      title: `Reset ${activeTargetQueue.length} ${
+        activeTargetQueue.length === 1 ? 'Image' : 'Images'
+      } to Original`,
+      current: activeTargetQueue.length,
+      total: activeTargetQueue.length,
+      percentage: 100,
+      currentFileName: 'Masks and undo/redo stacks cleared',
+      isComplete: true,
+    });
+
+    setTimeout(() => {
+      setBatchProgress(null);
+    }, 1500);
+
+    setShowBatchResetConfirmModal(false);
+  }, [activeTargetQueue]);
+
   // Helper to load and process a single image file
   const processImageFile = useCallback(
     (file: File): Promise<QueueItem | null> => {
@@ -638,7 +717,7 @@ export default function App() {
             let processingMs = 0;
             let quality = computeReconstructionQuality(origData, cleanedData, mask);
 
-            if (autoCleanOnUpload) {
+            if (autoCleanOnUpload || isSimpleMode) {
               const res = runAutomaticPipeline(origData);
               mask = res.mask;
               zones = res.zones;
@@ -675,7 +754,7 @@ export default function App() {
         reader.readAsDataURL(file);
       });
     },
-    [autoCleanOnUpload, runAutomaticPipeline]
+    [autoCleanOnUpload, isSimpleMode, runAutomaticPipeline]
   );
 
   // Handle file uploads (single or batch, plus clipboard files) with queue progress feedback
@@ -787,10 +866,31 @@ export default function App() {
         return;
       }
       if (e.key === 'Escape') {
+        if (showShortcutsModal) {
+          setShowShortcutsModal(false);
+          return;
+        }
+        if (showBatchResetConfirmModal) {
+          setShowBatchResetConfirmModal(false);
+          return;
+        }
         if (showResetConfirmModal) {
           setShowResetConfirmModal(false);
           return;
         }
+        if (showBulkCropModal) {
+          setShowBulkCropModal(false);
+          return;
+        }
+        if (showBatchRenameModal) {
+          setShowBatchRenameModal(false);
+          return;
+        }
+      }
+      if (e.key === '?' || (e.shiftKey && e.key === '/')) {
+        e.preventDefault();
+        setShowShortcutsModal((prev) => !prev);
+        return;
       }
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'z') {
         e.preventDefault();
@@ -829,7 +929,7 @@ export default function App() {
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('paste', handlePasteEvent);
     };
-  }, [undoMask, redoMask, handleFilesSelected, showResetConfirmModal]);
+  }, [undoMask, redoMask, handleFilesSelected, showResetConfirmModal, showBatchResetConfirmModal, showShortcutsModal, showBulkCropModal, showBatchRenameModal]);
 
   // Render the active image, split comparison, mask overlay, and detection zones onto the main canvas
   useEffect(() => {
@@ -917,7 +1017,7 @@ export default function App() {
       ctx.strokeRect(rx, ry, rw, rh);
       ctx.restore();
     }
-  }, [activeItem, viewMode, comparePosition, showZoneBoxes, dragRect, isHoldingOriginal]);
+  }, [activeItem, viewMode, comparePosition, showZoneBoxes, dragRect, isHoldingOriginal, isSimpleMode]);
 
   const getCanvasCoords = (e: React.PointerEvent<HTMLCanvasElement>) => {
     const canvas = displayCanvasRef.current;
@@ -1250,6 +1350,73 @@ export default function App() {
     }
   };
 
+  // Export queued images (or active selection) individually directly to disk, bypassing ZIP packaging
+  const exportAllIndividually = async () => {
+    const targetItems = activeTargetQueue;
+    if (targetItems.length === 0 || isExportingIndividually || isZipping || isBatchProcessing) return;
+    setIsExportingIndividually(true);
+
+    setBatchProgress({
+      active: true,
+      title:
+        targetItems.length === queue.length
+          ? 'Exporting All Images Individually'
+          : `Exporting ${targetItems.length} Selected Individually`,
+      current: 0,
+      total: targetItems.length,
+      percentage: 0,
+      currentFileName: targetItems[0]?.name,
+      isComplete: false,
+    });
+
+    try {
+      for (let i = 0; i < targetItems.length; i++) {
+        const item = targetItems[i];
+        const isLast = i === targetItems.length - 1;
+
+        setBatchProgress({
+          active: true,
+          title:
+            targetItems.length === queue.length
+              ? 'Exporting Images Individually (Direct)'
+              : `Exporting ${targetItems.length} Selected Individually`,
+          current: i + 1,
+          total: targetItems.length,
+          percentage: Math.round(((i + 1) / targetItems.length) * 100),
+          currentFileName: item.name,
+          isComplete: isLast,
+        });
+
+        await downloadItem(item);
+
+        // Stagger sequential browser downloads so Chrome/Edge/Safari won't throttle or block popups
+        if (!isLast) {
+          await new Promise((r) => setTimeout(r, 260));
+        }
+      }
+
+      setBatchProgress({
+        active: true,
+        title: `Exported ${targetItems.length} Individual ${
+          targetItems.length === 1 ? 'Image' : 'Images'
+        } (ZIP Bypassed)`,
+        current: targetItems.length,
+        total: targetItems.length,
+        percentage: 100,
+        currentFileName: `Direct single-file downloads completed · ${
+          smartOptimize ? `Optimized ${optimizeFormat.toUpperCase()}` : 'Clean PNG'
+        }`,
+        isComplete: true,
+      });
+
+      setTimeout(() => {
+        setBatchProgress(null);
+      }, 2000);
+    } finally {
+      setIsExportingIndividually(false);
+    }
+  };
+
   // Bulk crop queued images (or active item) with consistent aspect ratio, corner margin trim, or coordinate box
   const handleApplyBulkCrop = useCallback(
     async (
@@ -1431,13 +1598,55 @@ export default function App() {
           </a>
         </nav>
 
-        {/* Zone 3: 1 primary action */}
-        <div className="flex items-center gap-3 shrink-0">
+        {/* Zone 3: Mode Switcher, Quick Help & Primary Export */}
+        <div className="flex items-center gap-2.5 shrink-0">
+          {/* Segmented Mode Toggle: Simple Mode vs Pro Studio */}
+          <div className="inline-flex items-center p-1 rounded-xl bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700">
+            <button
+              type="button"
+              onClick={() => {
+                setIsSimpleMode(true);
+                setAutoCleanOnUpload(true);
+              }}
+              className={`px-3 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer ${
+                isSimpleMode
+                  ? 'bg-blue-600 text-white shadow-xs'
+                  : 'text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white'
+              }`}
+              title="Simple 1-Box Mode with automatic processing and big buttons"
+            >
+              <Zap className="w-3.5 h-3.5" />
+              <span>Simple Mode</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setIsSimpleMode(false)}
+              className={`px-3 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer ${
+                !isSimpleMode
+                  ? 'bg-slate-900 dark:bg-blue-600 text-white shadow-xs'
+                  : 'text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white'
+              }`}
+              title="Full 3-column Studio Workbench with manual brushes and batch controls"
+            >
+              <Sparkles className="w-3.5 h-3.5" />
+              <span>Pro Studio</span>
+            </button>
+          </div>
+
           <PWAInstallButton />
+          <button
+            type="button"
+            onClick={() => setShowShortcutsModal(true)}
+            className="p-2 rounded-lg text-slate-500 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-100 hover:bg-slate-100 dark:hover:bg-slate-800 border border-slate-200 dark:border-slate-800 transition-colors cursor-pointer flex items-center justify-center shadow-2xs"
+            title="Keyboard Shortcuts & Power Features (?)"
+            aria-label="Keyboard Shortcuts"
+          >
+            <HelpCircle className="w-4 h-4" />
+          </button>
           <button
             onClick={() => activeItem && downloadItem(activeItem)}
             disabled={!activeItem}
-            className="flex items-center gap-2 px-4 py-2 text-xs font-semibold text-white bg-slate-900 dark:bg-blue-600 rounded-lg hover:bg-slate-800 dark:hover:bg-blue-500 disabled:opacity-40 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            className="flex items-center gap-2 px-4 py-2 text-xs font-semibold text-white bg-slate-900 dark:bg-blue-600 rounded-lg hover:bg-slate-800 dark:hover:bg-blue-500 disabled:opacity-40 transition-colors whitespace-nowrap shrink-0 cursor-pointer shadow-2xs"
           >
             <Download className="w-3.5 h-3.5" />
             <span>Export Clean PNG</span>
@@ -1471,7 +1680,9 @@ export default function App() {
       {/* Workspace Sub-Toolbar: Breadcrumbs, Offline readiness, and Theme / Upload controls */}
       <div className="flex flex-wrap items-center justify-between gap-4 px-6 py-2.5 border-b border-slate-200 dark:border-slate-800 bg-slate-100/70 dark:bg-slate-900/50 text-xs">
         <div className="flex items-center gap-2 text-slate-600 dark:text-slate-400">
-          <span className="font-medium text-slate-900 dark:text-slate-200">Studio Workbench</span>
+          <span className="font-medium text-slate-900 dark:text-slate-200">
+            {isSimpleMode ? 'Simple Mode (1-Box Auto)' : 'Studio Workbench'}
+          </span>
           <ChevronRight className="w-3.5 h-3.5 text-slate-400" />
           <span>{activeItem ? activeItem.name : 'No Image Loaded'}</span>
           {activeItem && (
@@ -1542,7 +1753,55 @@ export default function App() {
         </div>
       </div>
 
-      {/* Main 1440px+ Studio Layout: Left Automatic Controls Sidebar + Center Interactive Viewport + Right Inspector */}
+      {/* Main Workspace: Either Simple 1-Box Mode or 1440px+ 3-Column Pro Studio Layout */}
+      {isSimpleMode ? (
+        <SimpleModeWorkspace
+          activeItem={activeItem}
+          queue={queue}
+          activeId={activeId}
+          onSelectQueueItem={(id) => setActiveId(id)}
+          onRemoveQueueItem={(id) => {
+            setQueue((prev) => prev.filter((q) => q.id !== id));
+            setSelectedIds((prev) => {
+              const next = new Set(prev);
+              next.delete(id);
+              return next;
+            });
+          }}
+          onOpenFilePicker={() => fileInputRef.current?.click()}
+          onPasteFromClipboard={handlePasteFromClipboard}
+          onDownloadActive={() => activeItem && downloadItem(activeItem)}
+          onExportAllIndividually={exportAllIndividually}
+          onDownloadAllZip={downloadAllCleanedAsZip}
+          removeText={removeText}
+          removeLogo={removeLogo}
+          onToggleRemoveText={() => {
+            const next = !removeText;
+            setRemoveText(next);
+            rerunActiveItemAuto({ remText: next });
+          }}
+          onToggleRemoveLogo={() => {
+            const next = !removeLogo;
+            setRemoveLogo(next);
+            rerunActiveItemAuto({ remLogo: next });
+          }}
+          onReRunAutoClean={() => rerunActiveItemAuto()}
+          isBatchProcessing={isBatchProcessing}
+          isZipping={isZipping}
+          isExportingIndividually={isExportingIndividually}
+          batchProgress={batchProgress}
+          samples={OFFLINE_SAMPLES}
+          onLoadSample={loadSamplePreset}
+          onSwitchToProMode={() => setIsSimpleMode(false)}
+          smartOptimize={smartOptimize}
+          onToggleSmartOptimize={() => setSmartOptimize((prev) => !prev)}
+          format={optimizeFormat}
+          quality={optimizeQuality}
+          onFormatChange={(fmt) => setOptimizeFormat(fmt)}
+          onQualityChange={(q) => setOptimizeQuality(q)}
+          savingsPercent={savingsEstimation.savedPercent}
+        />
+      ) : (
       <main id="workspace" className="flex-1 grid grid-cols-1 lg:grid-cols-12 min-h-[calc(100vh-110px)]">
         {/* Left Sidebar: Automatic Detection & Inpainting Controls */}
         <aside className="lg:col-span-3 border-b lg:border-b-0 lg:border-r border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-5 flex flex-col justify-between gap-6">
@@ -2025,6 +2284,22 @@ export default function App() {
                     <RotateCcw className="w-3 h-3" />
                     <span>Reset</span>
                   </button>
+
+                  {autoCropSuggestion && (
+                    <button
+                      type="button"
+                      onClick={handleSuggestAutoCrop}
+                      disabled={isBatchProcessing || isZipping || isExportingIndividually || isBulkCropping}
+                      className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-indigo-50 hover:bg-indigo-100/80 dark:bg-indigo-950/50 dark:hover:bg-indigo-900/60 text-indigo-700 dark:text-indigo-300 border border-indigo-200/80 dark:border-indigo-800/80 text-[11px] font-semibold transition-colors cursor-pointer whitespace-nowrap shrink-0 shadow-2xs"
+                      title={`Suggest Auto-Crop for Bulk Crop tool: ${autoCropSuggestion.reason}`}
+                    >
+                      <Crop className="w-3 h-3 text-indigo-600 dark:text-indigo-400" />
+                      <span>Suggest Auto-Crop</span>
+                      <span className="font-mono text-[10px] px-1.5 py-0.2 rounded bg-indigo-100 dark:bg-indigo-900/80 text-indigo-800 dark:text-indigo-200 font-bold">
+                        {autoCropSuggestion.summaryBadge}
+                      </span>
+                    </button>
+                  )}
                 </div>
               )}
             </div>
@@ -2275,7 +2550,7 @@ export default function App() {
                 <button
                   type="button"
                   onClick={batchUndoQueue}
-                  disabled={batchUndoableCount === 0 || isBatchProcessing || isZipping}
+                  disabled={batchUndoableCount === 0 || isBatchProcessing || isZipping || isExportingIndividually || isBulkCropping}
                   className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-semibold bg-slate-100 hover:bg-slate-200/80 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 hover:text-slate-900 dark:text-slate-300 dark:hover:text-white border border-slate-200 dark:border-slate-700 disabled:opacity-35 disabled:pointer-events-none transition-colors cursor-pointer whitespace-nowrap shadow-2xs"
                   title={
                     batchUndoableCount > 0
@@ -2288,6 +2563,27 @@ export default function App() {
                   {batchUndoableCount > 0 && (
                     <span className="font-mono text-[10px] px-1.5 py-0.2 rounded bg-blue-100 dark:bg-blue-900/60 text-blue-700 dark:text-sky-300 font-bold">
                       {batchUndoableCount}
+                    </span>
+                  )}
+                </button>
+
+                {/* Batch Reset All Button */}
+                <button
+                  type="button"
+                  onClick={() => setShowBatchResetConfirmModal(true)}
+                  disabled={batchResettableCount === 0 || isBatchProcessing || isZipping || isExportingIndividually || isBulkCropping}
+                  className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-semibold bg-rose-50 hover:bg-rose-100/80 dark:bg-rose-950/40 dark:hover:bg-rose-900/50 text-rose-700 hover:text-rose-800 dark:text-rose-300 dark:hover:text-rose-200 border border-rose-200 dark:border-rose-900/60 disabled:opacity-35 disabled:pointer-events-none transition-colors cursor-pointer whitespace-nowrap shadow-2xs"
+                  title={
+                    batchResettableCount > 0
+                      ? `Reset All: Clear masks and undo/redo stacks across ${batchResettableCount} selected items`
+                      : 'No masks or history to reset for selected items'
+                  }
+                >
+                  <RotateCcw className="w-3.5 h-3.5 text-rose-600 dark:text-rose-400" />
+                  <span>Reset All</span>
+                  {batchResettableCount > 0 && (
+                    <span className="font-mono text-[10px] px-1.5 py-0.2 rounded bg-rose-100 dark:bg-rose-900/70 text-rose-700 dark:text-rose-300 font-bold">
+                      {batchResettableCount}
                     </span>
                   )}
                 </button>
@@ -2393,41 +2689,14 @@ export default function App() {
                 </label>
               </div>
 
-              {/* Format selection when Smart Optimize is active */}
+              {/* Export Presets Dropdown & Format/Quality controls when Smart Optimize is active */}
               {smartOptimize && (
-                <div className="pt-2 border-t border-slate-200/80 dark:border-slate-800/80 space-y-2 text-xs">
-                  <div className="flex items-center justify-between text-[11px]">
-                    <span className="text-slate-600 dark:text-slate-400 font-medium">Export Format:</span>
-                    <div className="flex items-center gap-1">
-                      {(
-                        [
-                          { id: 'webp', label: 'WebP', desc: '-65% size' },
-                          { id: 'jpeg', label: 'JPEG', desc: '90% quality' },
-                          { id: 'png', label: 'Clean PNG', desc: 'Lossless' },
-                        ] as const
-                      ).map((fmt) => (
-                        <button
-                          key={fmt.id}
-                          type="button"
-                          onClick={() => setOptimizeFormat(fmt.id)}
-                          className={`px-2 py-0.5 rounded text-[10px] font-medium transition-colors cursor-pointer ${
-                            optimizeFormat === fmt.id
-                              ? 'bg-emerald-600 text-white font-semibold shadow-xs'
-                              : 'bg-white dark:bg-slate-800 text-slate-600 dark:text-slate-300 border border-slate-200 dark:border-slate-700 hover:bg-slate-100'
-                          }`}
-                          title={fmt.desc}
-                        >
-                          {fmt.label}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-
-                  <div className="flex items-center gap-1.5 text-[10px] text-slate-500 dark:text-slate-400">
-                    <ShieldCheck className="w-3 h-3 text-emerald-600 dark:text-emerald-400 shrink-0" />
-                    <span>Auto-strips camera EXIF, GPS location tags, and software metadata.</span>
-                  </div>
-                </div>
+                <ExportPresetsDropdown
+                  format={optimizeFormat}
+                  quality={optimizeQuality}
+                  onFormatChange={(fmt) => setOptimizeFormat(fmt)}
+                  onQualityChange={(q) => setOptimizeQuality(q)}
+                />
               )}
 
               {/* Visual Real-Time Savings Preview Card */}
@@ -2569,12 +2838,12 @@ export default function App() {
               </div>
             </div>
 
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+            <div className="grid grid-cols-2 gap-2">
               <button
                 type="button"
                 onClick={() => setShowBatchRenameModal(true)}
-                disabled={queue.length === 0 || isBatchProcessing || isZipping || isBulkCropping}
-                className="w-full py-2 px-2.5 rounded-lg bg-white dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700 border border-slate-200 dark:border-slate-700 text-slate-800 dark:text-slate-200 text-xs font-semibold flex items-center justify-center gap-1.5 disabled:opacity-40 transition-colors cursor-pointer whitespace-nowrap shrink-0 shadow-xs"
+                disabled={queue.length === 0 || isBatchProcessing || isZipping || isExportingIndividually || isBulkCropping}
+                className="w-full py-2 px-2.5 rounded-lg bg-white dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700 border border-slate-200 dark:border-slate-700 text-slate-800 dark:text-slate-200 text-xs font-semibold flex items-center justify-center gap-1.5 disabled:opacity-40 transition-colors cursor-pointer whitespace-nowrap shrink-0 shadow-2xs"
                 title={
                   selectedCount > 0 && selectedCount < queue.length
                     ? `Define a naming pattern for ${selectedCount} selected images`
@@ -2592,8 +2861,8 @@ export default function App() {
               <button
                 type="button"
                 onClick={() => setShowBulkCropModal(true)}
-                disabled={queue.length === 0 || isBatchProcessing || isZipping || isBulkCropping}
-                className="w-full py-2 px-2.5 rounded-lg bg-white dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700 border border-slate-200 dark:border-slate-700 text-slate-800 dark:text-slate-200 text-xs font-semibold flex items-center justify-center gap-1.5 disabled:opacity-40 transition-colors cursor-pointer whitespace-nowrap shrink-0 shadow-xs"
+                disabled={queue.length === 0 || isBatchProcessing || isZipping || isExportingIndividually || isBulkCropping}
+                className="w-full py-2 px-2.5 rounded-lg bg-white dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700 border border-slate-200 dark:border-slate-700 text-slate-800 dark:text-slate-200 text-xs font-semibold flex items-center justify-center gap-1.5 disabled:opacity-40 transition-colors cursor-pointer whitespace-nowrap shrink-0 shadow-2xs"
                 title={
                   selectedCount > 0 && selectedCount < queue.length
                     ? `Define a consistent aspect ratio or crop box for ${selectedCount} selected images`
@@ -2608,19 +2877,47 @@ export default function App() {
                 </span>
               </button>
 
+              {/* Dedicated Export All Button (Direct Single-File Downloads, Bypassing ZIP) */}
+              <button
+                type="button"
+                onClick={exportAllIndividually}
+                disabled={queue.length === 0 || isExportingIndividually || isZipping || isBatchProcessing || isBulkCropping}
+                className="w-full py-2 px-2.5 rounded-lg bg-blue-50 hover:bg-blue-100/80 dark:bg-blue-950/40 dark:hover:bg-blue-900/50 border border-blue-200 dark:border-blue-800/80 text-blue-700 dark:text-sky-300 text-xs font-semibold flex items-center justify-center gap-1.5 disabled:opacity-40 transition-colors cursor-pointer whitespace-nowrap shrink-0 shadow-2xs"
+                title={
+                  selectedCount > 0 && selectedCount < queue.length
+                    ? `Export ${selectedCount} selected images individually directly to disk, bypassing ZIP compression`
+                    : 'Export all queued images individually directly to disk, bypassing ZIP compression'
+                }
+              >
+                <FileDown className="w-3.5 h-3.5 text-blue-600 dark:text-sky-400" />
+                <span>
+                  {isExportingIndividually
+                    ? 'Exporting Files...'
+                    : selectedCount > 0 && selectedCount < queue.length
+                    ? `Export (${selectedCount})`
+                    : `Export All (${queue.length})`}
+                </span>
+              </button>
+
+              {/* Download ZIP Archive Button */}
               <button
                 type="button"
                 onClick={downloadAllCleanedAsZip}
-                disabled={queue.length === 0 || isZipping || isBatchProcessing || isBulkCropping}
-                className="w-full py-2 px-2.5 rounded-lg bg-slate-900 dark:bg-blue-600 hover:bg-slate-800 dark:hover:bg-blue-500 border border-slate-800 dark:border-blue-600 text-white text-xs font-semibold flex items-center justify-center gap-1.5 disabled:opacity-40 transition-colors cursor-pointer whitespace-nowrap shrink-0"
+                disabled={queue.length === 0 || isZipping || isExportingIndividually || isBatchProcessing || isBulkCropping}
+                className="w-full py-2 px-2.5 rounded-lg bg-slate-900 dark:bg-blue-600 hover:bg-slate-800 dark:hover:bg-blue-500 border border-slate-800 dark:border-blue-600 text-white text-xs font-semibold flex items-center justify-center gap-1.5 disabled:opacity-40 transition-colors cursor-pointer whitespace-nowrap shrink-0 shadow-2xs"
+                title={
+                  selectedCount > 0 && selectedCount < queue.length
+                    ? `Package ${selectedCount} selected images into a single compressed ZIP file`
+                    : 'Package all queued images into a single compressed ZIP file'
+                }
               >
                 <FolderArchive className="w-3.5 h-3.5 text-sky-400 dark:text-white" />
                 <span>
                   {isZipping
                     ? 'Packaging...'
                     : selectedCount > 0 && selectedCount < queue.length
-                    ? `Download (${selectedCount})`
-                    : `Download All (${queue.length})`}
+                    ? `ZIP (${selectedCount})`
+                    : `Download ZIP (${queue.length})`}
                 </span>
               </button>
             </div>
@@ -2798,6 +3095,7 @@ export default function App() {
           </div>
         </aside>
       </main>
+      )}
 
       {/* Architecture & Offline Pipeline Section below the workbench */}
       <section
@@ -2952,6 +3250,117 @@ export default function App() {
         </div>
       )}
 
+      {/* Batch Reset All Confirmation Modal */}
+      {showBatchResetConfirmModal && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="batch-reset-modal-title"
+          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-xs animate-in fade-in duration-150"
+          onClick={() => setShowBatchResetConfirmModal(false)}
+        >
+          <div
+            className="bg-white dark:bg-slate-900 rounded-2xl max-w-md w-full p-6 shadow-2xl border border-slate-200 dark:border-slate-800 space-y-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-start justify-between">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-xl bg-rose-500/10 text-rose-600 dark:text-rose-400 flex items-center justify-center shrink-0 border border-rose-500/20">
+                  <RotateCcw className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 id="batch-reset-modal-title" className="text-base font-bold text-slate-900 dark:text-slate-100">
+                    Reset Selected Queue Items?
+                  </h3>
+                  <p className="text-xs text-slate-500 dark:text-slate-400">
+                    {activeTargetQueue.length === 1
+                      ? '1 image selected in batch queue'
+                      : `${activeTargetQueue.length} images selected in batch queue`}
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowBatchResetConfirmModal(false)}
+                className="text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 p-1 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="p-3.5 rounded-xl bg-rose-500/10 border border-rose-500/25 space-y-1.5">
+              <div className="flex items-center gap-1.5 text-xs font-semibold text-rose-700 dark:text-rose-300">
+                <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                <span>Destructive Batch Action</span>
+              </div>
+              <p className="text-[11px] text-rose-800/80 dark:text-rose-300/80 leading-relaxed">
+                This will permanently wipe all inpainting masks, detected watermark zones, and undo/redo stacks across{' '}
+                <strong>
+                  {activeTargetQueue.length} {activeTargetQueue.length === 1 ? 'image' : 'images'}
+                </strong>. All selected images will be restored to their original uncleaned state.
+              </p>
+            </div>
+
+            {/* Target Images Mini Preview List */}
+            <div className="space-y-1.5">
+              <div className="text-[11px] font-semibold text-slate-700 dark:text-slate-300">
+                Images to be reset ({activeTargetQueue.length}):
+              </div>
+              <div className="max-h-40 overflow-y-auto rounded-lg border border-slate-200 dark:border-slate-800 divide-y divide-slate-100 dark:divide-slate-800/60 bg-slate-50/50 dark:bg-slate-900/50">
+                {activeTargetQueue.map((item) => (
+                  <div key={item.id} className="flex items-center justify-between p-2 text-xs">
+                    <div className="flex items-center gap-2 min-w-0 pr-2">
+                      <img
+                        src={item.originalUrl}
+                        alt={item.name}
+                        className="w-7 h-7 rounded object-cover border border-slate-200 dark:border-slate-700 shrink-0"
+                      />
+                      <span className="truncate font-medium text-slate-800 dark:text-slate-200 text-[11px]">
+                        {item.name}
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-1.5 shrink-0 text-[10px] font-mono text-slate-500 dark:text-slate-400">
+                      {item.coveragePercent > 0 ? (
+                        <span className="text-amber-600 dark:text-amber-400 font-medium">
+                          {item.coveragePercent}% mask
+                        </span>
+                      ) : (
+                        <span className="text-slate-400">clean</span>
+                      )}
+                      {item.undoStack.length > 0 && (
+                        <span className="px-1.5 py-0.2 rounded bg-slate-200/80 dark:bg-slate-800 text-slate-700 dark:text-slate-300">
+                          {item.undoStack.length} undo{item.undoStack.length > 1 ? 's' : ''}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <div className="flex items-center justify-end gap-2.5 pt-2 border-t border-slate-100 dark:border-slate-800/80">
+              <button
+                type="button"
+                onClick={() => setShowBatchResetConfirmModal(false)}
+                className="px-3.5 py-2 text-xs font-medium rounded-lg text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 border border-slate-200 dark:border-slate-700 transition-colors cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={executeBatchReset}
+                className="px-4 py-2 text-xs font-medium rounded-lg bg-rose-600 hover:bg-rose-500 active:bg-rose-700 text-white shadow-xs transition-colors cursor-pointer flex items-center gap-1.5 font-semibold"
+              >
+                <RotateCcw className="w-3.5 h-3.5" />
+                <span>
+                  Reset {activeTargetQueue.length} {activeTargetQueue.length === 1 ? 'Image' : 'Images'}
+                </span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Bulk Crop Tool Modal */}
       <BulkCropModal
         isOpen={showBulkCropModal}
@@ -2960,6 +3369,8 @@ export default function App() {
         queueCount={activeTargetQueue.length}
         isApplying={isBulkCropping}
         onApplyCrop={handleApplyBulkCrop}
+        autoCropSuggestion={autoCropSuggestion}
+        autoApplySuggestionToken={autoCropTriggerToken}
       />
 
       {/* Batch Rename Pattern Modal */}
@@ -2968,6 +3379,12 @@ export default function App() {
         onClose={() => setShowBatchRenameModal(false)}
         queue={activeTargetQueue}
         onApplyRename={handleApplyBatchRename}
+      />
+
+      {/* Keyboard Shortcuts & Quick Actions Reference Modal */}
+      <KeyboardShortcutsModal
+        isOpen={showShortcutsModal}
+        onClose={() => setShowShortcutsModal(false)}
       />
     </div>
   );

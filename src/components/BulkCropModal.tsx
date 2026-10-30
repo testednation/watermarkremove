@@ -26,6 +26,7 @@ import {
   calculateCropRect,
   WATERMARK_CROP_PRESETS,
   ASPECT_RATIO_VALUES,
+  AutoCropSuggestion,
 } from '../lib/cropEngine';
 
 interface BulkCropModalProps {
@@ -53,6 +54,8 @@ interface BulkCropModalProps {
     scope: 'all' | 'active',
     recleanAfterCrop: boolean
   ) => Promise<void>;
+  autoCropSuggestion?: AutoCropSuggestion | null;
+  autoApplySuggestionToken?: number;
 }
 
 export function BulkCropModal({
@@ -62,6 +65,8 @@ export function BulkCropModal({
   queueCount,
   isApplying,
   onApplyCrop,
+  autoCropSuggestion,
+  autoApplySuggestionToken = 0,
 }: BulkCropModalProps) {
   const [mode, setMode] = useState<CropMode>('margins');
   const [aspectRatio, setAspectRatio] = useState<AspectRatioPreset>('16:9');
@@ -77,6 +82,36 @@ export function BulkCropModal({
 
   const [scope, setScope] = useState<'all' | 'active'>('all');
   const [recleanAfterCrop, setRecleanAfterCrop] = useState<boolean>(true);
+  const [lastAppliedToken, setLastAppliedToken] = useState<number>(0);
+
+  // Apply Auto-Crop suggestion when triggered from the workspace button
+  useEffect(() => {
+    if (autoApplySuggestionToken > lastAppliedToken && autoCropSuggestion) {
+      setMode('margins');
+      setMarginTop(autoCropSuggestion.marginTop);
+      setMarginBottom(autoCropSuggestion.marginBottom);
+      setMarginLeft(autoCropSuggestion.marginLeft);
+      setMarginRight(autoCropSuggestion.marginRight);
+      setLastAppliedToken(autoApplySuggestionToken);
+    }
+  }, [autoApplySuggestionToken, lastAppliedToken, autoCropSuggestion]);
+
+  const applyAutoCropSuggestion = () => {
+    if (!autoCropSuggestion) return;
+    setMode('margins');
+    setMarginTop(autoCropSuggestion.marginTop);
+    setMarginBottom(autoCropSuggestion.marginBottom);
+    setMarginLeft(autoCropSuggestion.marginLeft);
+    setMarginRight(autoCropSuggestion.marginRight);
+  };
+
+  const isAutoSuggestionActive =
+    !!autoCropSuggestion &&
+    mode === 'margins' &&
+    marginTop === autoCropSuggestion.marginTop &&
+    marginBottom === autoCropSuggestion.marginBottom &&
+    marginLeft === autoCropSuggestion.marginLeft &&
+    marginRight === autoCropSuggestion.marginRight;
 
   // Close on Escape key
   useEffect(() => {
@@ -288,6 +323,79 @@ export function BulkCropModal({
                       ? 'The crop boundary cuts cleanly outside all detected watermark zones. No inpainting artifacts will remain.'
                       : 'Remaining watermark zones inside the crop box will be automatically inpainted if auto-clean is kept enabled.'}
                   </div>
+                </div>
+              </div>
+            )}
+
+            {/* Smart Auto-Crop Edge Analysis Card */}
+            {autoCropSuggestion && (
+              <div
+                className={`p-3 rounded-xl border text-xs space-y-2 transition-all ${
+                  isAutoSuggestionActive
+                    ? 'bg-indigo-500/10 dark:bg-indigo-950/40 border-indigo-500/35 text-slate-800 dark:text-slate-100'
+                    : 'bg-slate-50 dark:bg-slate-800/50 border-slate-200 dark:border-slate-700/80 text-slate-700 dark:text-slate-200'
+                }`}
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-1.5 font-semibold text-indigo-700 dark:text-indigo-300">
+                    <Sparkles className="w-3.5 h-3.5 shrink-0" />
+                    <span>Auto-Crop Margin & Edge Noise Analysis</span>
+                    <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-indigo-100 dark:bg-indigo-900/70 text-indigo-700 dark:text-indigo-300">
+                      {autoCropSuggestion.confidence}% conf
+                    </span>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={applyAutoCropSuggestion}
+                    disabled={isAutoSuggestionActive}
+                    className={`px-2.5 py-1 rounded-lg text-[11px] font-semibold transition-colors cursor-pointer shrink-0 flex items-center gap-1 ${
+                      isAutoSuggestionActive
+                        ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 border border-emerald-500/30 cursor-default'
+                        : 'bg-indigo-600 hover:bg-indigo-500 text-white shadow-2xs'
+                    }`}
+                  >
+                    {isAutoSuggestionActive ? (
+                      <>
+                        <Check className="w-3 h-3" />
+                        <span>Suggested Active</span>
+                      </>
+                    ) : (
+                      <>
+                        <Sparkles className="w-3 h-3" />
+                        <span>Use Suggested ({autoCropSuggestion.summaryBadge})</span>
+                      </>
+                    )}
+                  </button>
+                </div>
+
+                <p className="text-[11px] text-slate-600 dark:text-slate-400 leading-relaxed">
+                  {autoCropSuggestion.reason}
+                </p>
+
+                {/* 4-Edge Diagnostic Breakdown */}
+                <div className="grid grid-cols-4 gap-1.5 pt-0.5">
+                  {(
+                    [
+                      { key: 'top', label: 'Top', data: autoCropSuggestion.edgeBreakdown.top },
+                      { key: 'bottom', label: 'Bottom', data: autoCropSuggestion.edgeBreakdown.bottom },
+                      { key: 'left', label: 'Left', data: autoCropSuggestion.edgeBreakdown.left },
+                      { key: 'right', label: 'Right', data: autoCropSuggestion.edgeBreakdown.right },
+                    ] as const
+                  ).map((edge) => (
+                    <div
+                      key={edge.key}
+                      className={`px-2 py-1 rounded-md border text-[10px] font-mono flex items-center justify-between ${
+                        edge.data.percent > 0
+                          ? 'bg-indigo-50/80 dark:bg-indigo-950/60 border-indigo-300/60 dark:border-indigo-800 text-indigo-700 dark:text-indigo-300 font-bold'
+                          : 'bg-white/60 dark:bg-slate-900/50 border-slate-200/70 dark:border-slate-800 text-slate-400'
+                      }`}
+                      title={edge.data.label}
+                    >
+                      <span>{edge.label}</span>
+                      <span>{edge.data.percent > 0 ? `-${edge.data.percent}%` : '0%'}</span>
+                    </div>
+                  ))}
                 </div>
               </div>
             )}

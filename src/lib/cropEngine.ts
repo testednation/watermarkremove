@@ -256,3 +256,410 @@ export function cropImageData(source: ImageData, rect: CropRect): ImageData {
 
   return outCtx.getImageData(0, 0, sw, sh);
 }
+
+export type EdgeAnomalyType = 'none' | 'empty-margin' | 'edge-noise' | 'watermark-band';
+
+export interface AutoCropEdgeDetail {
+  percent: number;
+  pixels: number;
+  type: EdgeAnomalyType;
+  label: string;
+}
+
+export interface AutoCropSuggestion {
+  params: CropParameters;
+  marginTop: number;
+  marginBottom: number;
+  marginLeft: number;
+  marginRight: number;
+  hasNonContentMargins: boolean;
+  confidence: number;
+  summaryBadge: string;
+  reason: string;
+  trimmedAreaPercent: number;
+  edgeBreakdown: {
+    top: AutoCropEdgeDetail;
+    bottom: AutoCropEdgeDetail;
+    left: AutoCropEdgeDetail;
+    right: AutoCropEdgeDetail;
+  };
+}
+
+/**
+ * Analyzes an image's outer periphery for empty/letterbox margins, consistent edge noise
+ * (e.g., scanner borders, broadcast artifacts, frame lines), and peripheral watermark bands,
+ * returning a suggested CropParameters configuration targeting non-content areas.
+ */
+export function analyzeAutoCropMargins(
+  imageData: ImageData,
+  zones: Array<{ x: number; y: number; width: number; height: number; label?: string }> = []
+): AutoCropSuggestion {
+  const { width, height, data } = imageData;
+  const maxScanRatio = 0.30; // Never auto-suggest trimming more than 30% on a single edge
+
+  // Helper to compute statistics for a horizontal row y (sampling every stepX pixels)
+  const getRowStats = (y: number) => {
+    const stepX = Math.max(1, Math.floor(width / 120));
+    let sumR = 0,
+      sumG = 0,
+      sumB = 0,
+      sumA = 0;
+    let sumSqR = 0,
+      sumSqG = 0,
+      sumSqB = 0;
+    let gradSum = 0;
+    let highFreqNoiseCount = 0;
+    let count = 0;
+    let prevLum = -1;
+    let prevDeltaSign = 0;
+
+    for (let x = 0; x < width; x += stepX) {
+      const idx = (y * width + x) * 4;
+      const r = data[idx];
+      const g = data[idx + 1];
+      const b = data[idx + 2];
+      const a = data[idx + 3];
+
+      sumR += r;
+      sumG += g;
+      sumB += b;
+      sumA += a;
+      sumSqR += r * r;
+      sumSqG += g * g;
+      sumSqB += b * b;
+
+      const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+      if (prevLum >= 0) {
+        const delta = lum - prevLum;
+        const absDelta = Math.abs(delta);
+        gradSum += absDelta;
+        const sign = delta > 3 ? 1 : delta < -3 ? -1 : 0;
+        if (sign !== 0 && prevDeltaSign !== 0 && sign !== prevDeltaSign && absDelta > 8) {
+          highFreqNoiseCount++;
+        }
+        if (sign !== 0) prevDeltaSign = sign;
+      }
+      prevLum = lum;
+      count++;
+    }
+
+    const n = Math.max(1, count);
+    const meanR = sumR / n;
+    const meanG = sumG / n;
+    const meanB = sumB / n;
+    const meanA = sumA / n;
+    const varR = Math.max(0, sumSqR / n - meanR * meanR);
+    const varG = Math.max(0, sumSqG / n - meanG * meanG);
+    const varB = Math.max(0, sumSqB / n - meanB * meanB);
+    const stdDev = Math.sqrt((varR + varG + varB) / 3);
+    const meanGrad = gradSum / Math.max(1, n - 1);
+    const noiseRatio = highFreqNoiseCount / Math.max(1, n - 1);
+    const meanLum = 0.299 * meanR + 0.587 * meanG + 0.114 * meanB;
+
+    return { meanR, meanG, meanB, meanA, meanLum, stdDev, meanGrad, noiseRatio };
+  };
+
+  // Helper to compute statistics for a vertical column x (sampling every stepY pixels)
+  const getColStats = (x: number) => {
+    const stepY = Math.max(1, Math.floor(height / 120));
+    let sumR = 0,
+      sumG = 0,
+      sumB = 0,
+      sumA = 0;
+    let sumSqR = 0,
+      sumSqG = 0,
+      sumSqB = 0;
+    let gradSum = 0;
+    let highFreqNoiseCount = 0;
+    let count = 0;
+    let prevLum = -1;
+    let prevDeltaSign = 0;
+
+    for (let y = 0; y < height; y += stepY) {
+      const idx = (y * width + x) * 4;
+      const r = data[idx];
+      const g = data[idx + 1];
+      const b = data[idx + 2];
+      const a = data[idx + 3];
+
+      sumR += r;
+      sumG += g;
+      sumB += b;
+      sumA += a;
+      sumSqR += r * r;
+      sumSqG += g * g;
+      sumSqB += b * b;
+
+      const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+      if (prevLum >= 0) {
+        const delta = lum - prevLum;
+        const absDelta = Math.abs(delta);
+        gradSum += absDelta;
+        const sign = delta > 3 ? 1 : delta < -3 ? -1 : 0;
+        if (sign !== 0 && prevDeltaSign !== 0 && sign !== prevDeltaSign && absDelta > 8) {
+          highFreqNoiseCount++;
+        }
+        if (sign !== 0) prevDeltaSign = sign;
+      }
+      prevLum = lum;
+      count++;
+    }
+
+    const n = Math.max(1, count);
+    const meanR = sumR / n;
+    const meanG = sumG / n;
+    const meanB = sumB / n;
+    const meanA = sumA / n;
+    const varR = Math.max(0, sumSqR / n - meanR * meanR);
+    const varG = Math.max(0, sumSqG / n - meanG * meanG);
+    const varB = Math.max(0, sumSqB / n - meanB * meanB);
+    const stdDev = Math.sqrt((varR + varG + varB) / 3);
+    const meanGrad = gradSum / Math.max(1, n - 1);
+    const noiseRatio = highFreqNoiseCount / Math.max(1, n - 1);
+    const meanLum = 0.299 * meanR + 0.587 * meanG + 0.114 * meanB;
+
+    return { meanR, meanG, meanB, meanA, meanLum, stdDev, meanGrad, noiseRatio };
+  };
+
+  // Scan an edge sequence of stats from index 0 .. maxLines - 1
+  const scanEdgeSequence = (
+    maxLines: number,
+    totalDim: number,
+    getStatsAt: (offset: number) => ReturnType<typeof getRowStats>
+  ): AutoCropEdgeDetail => {
+    if (maxLines < 2) {
+      return { percent: 0, pixels: 0, type: 'none', label: 'Clean edge' };
+    }
+
+    const statsList: Array<ReturnType<typeof getRowStats>> = [];
+    for (let i = 0; i < maxLines; i++) {
+      statsList.push(getStatsAt(i));
+    }
+
+    const base = statsList[0];
+    let emptyMarginLines = 0;
+
+    // 1. Check for uniform / empty margin (solid border, letterbox, padding, or transparency)
+    for (let i = 0; i < maxLines; i++) {
+      const st = statsList[i];
+      const colorDist = Math.sqrt(
+        Math.pow(st.meanR - base.meanR, 2) +
+          Math.pow(st.meanG - base.meanG, 2) +
+          Math.pow(st.meanB - base.meanB, 2)
+      );
+
+      const isTransparent = st.meanA < 32;
+      const isUniformLine = st.stdDev < 13.5 && st.meanGrad < 8.5 && colorDist < 20;
+
+      if (isTransparent || isUniformLine) {
+        emptyMarginLines = i + 1;
+      } else {
+        break;
+      }
+    }
+
+    // 2. Check for consistent edge noise or framed border seam within outer 16%
+    let edgeNoiseLines = 0;
+    const maxNoiseLines = Math.min(maxLines - 1, Math.floor(totalDim * 0.16));
+    for (let i = 0; i < maxNoiseLines; i++) {
+      const st = statsList[i];
+      const nextSt = statsList[i + 1];
+      const lumJump = Math.abs(nextSt.meanLum - st.meanLum);
+
+      // High-frequency static noise along the border or sharp frame boundary seam
+      if (st.noiseRatio > 0.34 && st.stdDev > 18) {
+        edgeNoiseLines = i + 1;
+      } else if (i >= 2 && i <= Math.floor(totalDim * 0.12) && lumJump > 34 && st.stdDev < 22) {
+        // Framed banner / border seam jump where outer strip was semi-uniform
+        edgeNoiseLines = Math.max(edgeNoiseLines, i + 1);
+        break;
+      }
+    }
+
+    if (emptyMarginLines >= Math.max(2, Math.round(totalDim * 0.01))) {
+      const pct = Math.min(30, Math.max(1, Math.round((emptyMarginLines / totalDim) * 100)));
+      return {
+        percent: pct,
+        pixels: emptyMarginLines,
+        type: 'empty-margin',
+        label: `Empty margin (${pct}%)`,
+      };
+    }
+
+    if (edgeNoiseLines >= Math.max(2, Math.round(totalDim * 0.01))) {
+      const pct = Math.min(25, Math.max(1, Math.round((edgeNoiseLines / totalDim) * 100)));
+      return {
+        percent: pct,
+        pixels: edgeNoiseLines,
+        type: 'edge-noise',
+        label: `Edge noise / frame (${pct}%)`,
+      };
+    }
+
+    return { percent: 0, pixels: 0, type: 'none', label: 'Clean edge' };
+  };
+
+  const maxRowScan = Math.floor(height * maxScanRatio);
+  const maxColScan = Math.floor(width * maxScanRatio);
+
+  const topDetail = scanEdgeSequence(maxRowScan, height, (i) => getRowStats(i));
+  const bottomDetail = scanEdgeSequence(maxRowScan, height, (i) => getRowStats(height - 1 - i));
+  const leftDetail = scanEdgeSequence(maxColScan, width, (i) => getColStats(i));
+  const rightDetail = scanEdgeSequence(maxColScan, width, (i) => getColStats(width - 1 - i));
+
+  // 3. Also evaluate peripheral watermark / overlay zones near image edges (within outer 22%)
+  // so that edge-hugging watermarks or timestamp strips are factored into non-content margin suggestions
+  for (const z of zones) {
+    const zTopRatio = z.y / height;
+    const zBottomRatio = (z.y + z.height) / height;
+    const zLeftRatio = z.x / width;
+    const zRightRatio = (z.x + z.width) / width;
+
+    // Bottom edge watermark band/stamp (most common)
+    if (zBottomRatio >= 0.78 && zTopRatio >= 0.72) {
+      const neededBottomPct = Math.min(
+        26,
+        Math.ceil(((height - z.y + Math.max(4, height * 0.01)) / height) * 100)
+      );
+      if (neededBottomPct > bottomDetail.percent && neededBottomPct <= 26) {
+        bottomDetail.percent = neededBottomPct;
+        bottomDetail.pixels = Math.round((neededBottomPct / 100) * height);
+        bottomDetail.type =
+          bottomDetail.type === 'empty-margin' ? 'empty-margin' : 'watermark-band';
+        bottomDetail.label = `Non-content watermark strip (${neededBottomPct}%)`;
+      }
+    }
+    // Top edge banner/timestamp
+    else if (zTopRatio <= 0.22 && zBottomRatio <= 0.25) {
+      const neededTopPct = Math.min(
+        24,
+        Math.ceil(((z.y + z.height + Math.max(4, height * 0.01)) / height) * 100)
+      );
+      if (neededTopPct > topDetail.percent && neededTopPct <= 24) {
+        topDetail.percent = neededTopPct;
+        topDetail.pixels = Math.round((neededTopPct / 100) * height);
+        topDetail.type = topDetail.type === 'empty-margin' ? 'empty-margin' : 'watermark-band';
+        topDetail.label = `Top non-content band (${neededTopPct}%)`;
+      }
+    }
+    // Right edge vertical stamp (only if narrow strip near right border)
+    else if (zRightRatio >= 0.82 && zLeftRatio >= 0.78 && z.width / width <= 0.22) {
+      const neededRightPct = Math.min(
+        22,
+        Math.ceil(((width - z.x + Math.max(4, width * 0.01)) / width) * 100)
+      );
+      if (neededRightPct > rightDetail.percent && neededRightPct <= 22) {
+        rightDetail.percent = neededRightPct;
+        rightDetail.pixels = Math.round((neededRightPct / 100) * width);
+        rightDetail.type = rightDetail.type === 'empty-margin' ? 'empty-margin' : 'watermark-band';
+        rightDetail.label = `Right edge stamp (${neededRightPct}%)`;
+      }
+    }
+    // Left edge vertical stamp
+    else if (zLeftRatio <= 0.18 && zRightRatio <= 0.22 && z.width / width <= 0.22) {
+      const neededLeftPct = Math.min(
+        22,
+        Math.ceil(((z.x + z.width + Math.max(4, width * 0.01)) / width) * 100)
+      );
+      if (neededLeftPct > leftDetail.percent && neededLeftPct <= 22) {
+        leftDetail.percent = neededLeftPct;
+        leftDetail.pixels = Math.round((neededLeftPct / 100) * width);
+        leftDetail.type = leftDetail.type === 'empty-margin' ? 'empty-margin' : 'watermark-band';
+        leftDetail.label = `Left edge stamp (${neededLeftPct}%)`;
+      }
+    }
+  }
+
+  let marginTop = topDetail.percent;
+  let marginBottom = bottomDetail.percent;
+  let marginLeft = leftDetail.percent;
+  let marginRight = rightDetail.percent;
+
+  const hasDetectedAny = marginTop + marginBottom + marginLeft + marginRight > 0;
+
+  // Build human-readable explanation and summary badge
+  const activeEdges: string[] = [];
+  const reasonParts: string[] = [];
+
+  if (marginTop > 0) {
+    activeEdges.push(`Top ${marginTop}%`);
+    reasonParts.push(topDetail.label.toLowerCase());
+  }
+  if (marginBottom > 0) {
+    activeEdges.push(`Bottom ${marginBottom}%`);
+    reasonParts.push(bottomDetail.label.toLowerCase());
+  }
+  if (marginLeft > 0) {
+    activeEdges.push(`Left ${marginLeft}%`);
+    reasonParts.push(leftDetail.label.toLowerCase());
+  }
+  if (marginRight > 0) {
+    activeEdges.push(`Right ${marginRight}%`);
+    reasonParts.push(rightDetail.label.toLowerCase());
+  }
+
+  let summaryBadge = 'Edge Trim';
+  let reason = '';
+  let confidence = 92;
+
+  if (hasDetectedAny) {
+    summaryBadge = activeEdges.slice(0, 2).join(' · ') + (activeEdges.length > 2 ? ` +${activeEdges.length - 2}` : '');
+    reason = `Detected ${reasonParts.join(', ')} on active image periphery.`;
+    const hasEmptyOrNoise =
+      [topDetail, bottomDetail, leftDetail, rightDetail].some(
+        (d) => d.type === 'empty-margin' || d.type === 'edge-noise'
+      );
+    confidence = hasEmptyOrNoise ? 96 : 91;
+  } else {
+    // Fallback when image is full-bleed with minimal edge noise: suggest a conservative 6% bottom trim
+    marginBottom = 6;
+    bottomDetail.percent = 6;
+    bottomDetail.pixels = Math.round(height * 0.06);
+    bottomDetail.type = 'edge-noise';
+    bottomDetail.label = 'Conservative bottom footer trim (6%)';
+    summaryBadge = 'Bottom 6%';
+    reason = 'No empty letterbox borders found; suggesting conservative 6% bottom periphery trim.';
+    confidence = 78;
+  }
+
+  const params: CropParameters = {
+    mode: 'margins',
+    marginTop,
+    marginBottom,
+    marginLeft,
+    marginRight,
+    aspectRatio: '16:9',
+    anchor: 'top-center',
+    boxX: marginLeft,
+    boxY: marginTop,
+    boxWidth: Math.max(20, 100 - marginLeft - marginRight),
+    boxHeight: Math.max(20, 100 - marginTop - marginBottom),
+  };
+
+  const rect = calculateCropRect(width, height, params);
+  const origArea = Math.max(1, width * height);
+  const trimmedAreaPercent = Math.max(
+    1,
+    Math.min(100, Math.round(((origArea - rect.width * rect.height) / origArea) * 100))
+  );
+
+  return {
+    params,
+    marginTop,
+    marginBottom,
+    marginLeft,
+    marginRight,
+    hasNonContentMargins: hasDetectedAny,
+    confidence,
+    summaryBadge,
+    reason,
+    trimmedAreaPercent,
+    edgeBreakdown: {
+      top: topDetail,
+      bottom: bottomDetail,
+      left: leftDetail,
+      right: rightDetail,
+    },
+  };
+}
+
