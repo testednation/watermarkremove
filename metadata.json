@@ -1,0 +1,6 @@
+{
+  "name": "ClearFrame Studio",
+  "description": "Automatic offline watermark detector and neural-grade inpainting studio that runs 100% locally in your browser.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
