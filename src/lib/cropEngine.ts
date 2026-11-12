@@ -663,3 +663,176 @@ export function analyzeAutoCropMargins(
   };
 }
 
+/**
+ * Renders a diagnostic Edge Noise & Non-Content Margin visualization in red onto a 2D canvas.
+ * Highlights high-frequency border noise, uniform empty margins, peripheral watermark artifacts,
+ * and Auto-Crop cut lines so users can see exactly why areas are targeted for cropping or cleanup.
+ */
+export function renderEdgeNoiseVisualization(
+  ctx: CanvasRenderingContext2D,
+  originalData: ImageData,
+  suggestion: AutoCropSuggestion,
+  watermarkMask?: Uint8Array,
+  options?: { overlayOnly?: boolean }
+): void {
+  const { width, height, data } = originalData;
+  const overlayOnly = options?.overlayOnly ?? false;
+
+  const topPx = Math.round((suggestion.marginTop / 100) * height);
+  const bottomPx = Math.round((suggestion.marginBottom / 100) * height);
+  const leftPx = Math.round((suggestion.marginLeft / 100) * width);
+  const rightPx = Math.round((suggestion.marginRight / 100) * width);
+
+  // Outer periphery scan window (at least 18% of dimension or the suggested margin)
+  const scanTop = Math.max(topPx, Math.round(height * 0.18));
+  const scanBottom = Math.max(bottomPx, Math.round(height * 0.18));
+  const scanLeft = Math.max(leftPx, Math.round(width * 0.18));
+  const scanRight = Math.max(rightPx, Math.round(width * 0.18));
+
+  const frameImage = ctx.getImageData(0, 0, width, height);
+  const out = frameImage.data;
+
+  for (let y = 0; y < height; y++) {
+    const inTargetTop = y < topPx;
+    const inTargetBottom = y >= height - bottomPx;
+    const inPeripheryY = y < scanTop || y >= height - scanBottom;
+    const rowOffset = y * width;
+
+    for (let x = 0; x < width; x++) {
+      const inTargetLeft = x < leftPx;
+      const inTargetRight = x >= width - rightPx;
+      const isTargetedMargin =
+        inTargetTop || inTargetBottom || inTargetLeft || inTargetRight;
+      const inPeriphery =
+        isTargetedMargin || inPeripheryY || x < scanLeft || x >= width - scanRight;
+
+      const idx = rowOffset + x;
+      const p = idx * 4;
+
+      if (!inPeriphery) {
+        if (!overlayOnly) {
+          // Slightly dim safe interior content so red edge noise stands out clearly
+          out[p] = Math.round(data[p] * 0.88);
+          out[p + 1] = Math.round(data[p + 1] * 0.88);
+          out[p + 2] = Math.round(data[p + 2] * 0.88);
+        }
+        continue;
+      }
+
+      // Compute local pixel noise / gradient spike intensity in periphery
+      let localGrad = 0;
+      if (x > 0 && x < width - 1 && y > 0 && y < height - 1) {
+        const pLeft = (idx - 1) * 4;
+        const pRight = (idx + 1) * 4;
+        const pUp = (idx - width) * 4;
+        const pDown = (idx + width) * 4;
+        const gx =
+          Math.abs(data[pRight] - data[pLeft]) +
+          Math.abs(data[pRight + 1] - data[pLeft + 1]) +
+          Math.abs(data[pRight + 2] - data[pLeft + 2]);
+        const gy =
+          Math.abs(data[pDown] - data[pUp]) +
+          Math.abs(data[pDown + 1] - data[pUp + 1]) +
+          Math.abs(data[pDown + 2] - data[pUp + 2]);
+        localGrad = (gx + gy) / 6;
+      }
+
+      const isMaskedWatermark = watermarkMask ? watermarkMask[idx] > 0 : false;
+      const isHighFreqEdgeSpike = localGrad > 20;
+
+      if (isTargetedMargin) {
+        // Inside the targeted Auto-Crop margin strip: highlight base zone in translucent red
+        // and boost actual noisy/watermark pixels in intense bright crimson red
+        const intensity = isMaskedWatermark || isHighFreqEdgeSpike ? 0.78 : 0.38;
+        const rTarget = isMaskedWatermark || isHighFreqEdgeSpike ? 255 : 239;
+        const gTarget = isMaskedWatermark || isHighFreqEdgeSpike ? 38 : 68;
+        const bTarget = isMaskedWatermark || isHighFreqEdgeSpike ? 38 : 68;
+
+        out[p] = Math.min(255, Math.round(out[p] * (1 - intensity) + rTarget * intensity));
+        out[p + 1] = Math.min(255, Math.round(out[p + 1] * (1 - intensity) + gTarget * intensity));
+        out[p + 2] = Math.min(255, Math.round(out[p + 2] * (1 - intensity) + bTarget * intensity));
+      } else if (isMaskedWatermark || localGrad > 32) {
+        // Peripheral noise or watermark artifact just inside the border inspection zone
+        const intensity = isMaskedWatermark ? 0.68 : Math.min(0.62, (localGrad - 28) / 85);
+        out[p] = Math.min(255, Math.round(out[p] * (1 - intensity) + 244 * intensity));
+        out[p + 1] = Math.min(255, Math.round(out[p + 1] * (1 - intensity) + 63 * intensity));
+        out[p + 2] = Math.min(255, Math.round(out[p + 2] * (1 - intensity) + 94 * intensity));
+      }
+    }
+  }
+
+  ctx.putImageData(frameImage, 0, 0);
+
+  // Draw crisp red diagonal hatch lines & dashed cut boundaries over targeted crop strips
+  ctx.save();
+  const lineWidth = Math.max(2, Math.round(Math.min(width, height) / 360));
+  ctx.strokeStyle = '#ef4444';
+  ctx.lineWidth = lineWidth;
+  ctx.setLineDash([8, 5]);
+
+  const cropX = leftPx;
+  const cropY = topPx;
+  const cropW = Math.max(2, width - leftPx - rightPx);
+  const cropH = Math.max(2, height - topPx - bottomPx);
+
+  ctx.strokeRect(cropX, cropY, cropW, cropH);
+  ctx.setLineDash([]);
+
+  // Helper to draw a red diagnostic badge explaining why an edge is targeted
+  const drawEdgeBadge = (text: string, cx: number, cy: number) => {
+    const fontSize = Math.max(11, Math.min(16, Math.round(width / 62)));
+    ctx.font = `bold ${fontSize}px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace`;
+    const metrics = ctx.measureText(text);
+    const padX = 10;
+    const padY = 6;
+    const boxW = metrics.width + padX * 2;
+    const boxH = fontSize + padY * 2;
+    const bx = Math.max(6, Math.min(width - boxW - 6, cx - boxW / 2));
+    const by = Math.max(6, Math.min(height - boxH - 6, cy - boxH / 2));
+
+    ctx.fillStyle = 'rgba(127, 29, 29, 0.92)';
+    ctx.strokeStyle = '#f87171';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.roundRect(bx, by, boxW, boxH, 6);
+    ctx.fill();
+    ctx.stroke();
+
+    ctx.fillStyle = '#fef2f2';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(text, bx + padX, by + boxH / 2);
+  };
+
+  if (suggestion.marginBottom > 0) {
+    drawEdgeBadge(
+      `TARGET BOTTOM: ${suggestion.edgeBreakdown.bottom.label.toUpperCase()}`,
+      width / 2,
+      height - Math.max(18, bottomPx / 2)
+    );
+  }
+  if (suggestion.marginTop > 0) {
+    drawEdgeBadge(
+      `TARGET TOP: ${suggestion.edgeBreakdown.top.label.toUpperCase()}`,
+      width / 2,
+      Math.max(18, topPx / 2)
+    );
+  }
+  if (suggestion.marginLeft > 0) {
+    drawEdgeBadge(
+      `LEFT: -${suggestion.marginLeft}%`,
+      Math.max(46, leftPx / 2),
+      height / 2
+    );
+  }
+  if (suggestion.marginRight > 0) {
+    drawEdgeBadge(
+      `RIGHT: -${suggestion.marginRight}%`,
+      width - Math.max(46, rightPx / 2),
+      height / 2
+    );
+  }
+
+  ctx.restore();
+}
+
+

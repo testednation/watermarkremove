@@ -60,6 +60,7 @@ import {
   calculateCropRect,
   cropImageData,
   analyzeAutoCropMargins,
+  renderEdgeNoiseVisualization,
 } from './lib/cropEngine';
 import { optimizeCleanedImage, OptimizeFormat, formatBytes, estimateQueueSizes } from './lib/optimizer';
 import {
@@ -68,7 +69,7 @@ import {
   getQualityBadgeStyles,
 } from './lib/qualityMetrics';
 
-type ViewMode = 'compare' | 'side-by-side' | 'clean' | 'mask' | 'original';
+type ViewMode = 'compare' | 'side-by-side' | 'clean' | 'mask' | 'edge-noise' | 'original';
 type ActiveTool = 'compare' | 'brush-add' | 'brush-erase' | 'rect-add' | 'magic-wand';
 
 interface BatchProgress {
@@ -131,7 +132,7 @@ export default function App() {
 
   // Automatic engine parameters
   const [detectionMode, setDetectionMode] = useState<DetectionMode>('smart-auto');
-  const [inpaintMethod, setInpaintMethod] = useState<InpaintMethod>('hybrid-smart');
+  const [inpaintMethod, setInpaintMethod] = useState<InpaintMethod>('neural-ai');
   const [sensitivity, setSensitivity] = useState<number>(68);
   const [dilationRadius, setDilationRadius] = useState<number>(5);
   const [autoCleanOnUpload, setAutoCleanOnUpload] = useState<boolean>(true);
@@ -149,6 +150,7 @@ export default function App() {
   const [brushSize, setBrushSize] = useState<number>(24);
   const [comparePosition, setComparePosition] = useState<number>(52);
   const [showZoneBoxes, setShowZoneBoxes] = useState<boolean>(true);
+  const [showEdgeNoiseOverlay, setShowEdgeNoiseOverlay] = useState<boolean>(false);
   const [showResetConfirmModal, setShowResetConfirmModal] = useState<boolean>(false);
   const [showBatchResetConfirmModal, setShowBatchResetConfirmModal] = useState<boolean>(false);
   const [showBulkCropModal, setShowBulkCropModal] = useState<boolean>(false);
@@ -856,6 +858,31 @@ export default function App() {
     }
   }, [handleFilesSelected]);
 
+  // Load image from URL (WatermarkRemover.io Paste URL workflow)
+  const handleLoadImageUrl = useCallback(
+    async (rawUrl: string) => {
+      const trimmed = rawUrl.trim();
+      if (!trimmed) return;
+      const resp = await fetch(trimmed, { mode: 'cors' });
+      if (!resp.ok) {
+        throw new Error(`HTTP ${resp.status}: Unable to fetch image from URL`);
+      }
+      const blob = await resp.blob();
+      const mimeType = blob.type.startsWith('image/') ? blob.type : 'image/png';
+      const urlName =
+        trimmed
+          .split('?')[0]
+          .split('/')
+          .pop()
+          ?.replace(/[^a-zA-Z0-9._-]/g, '') || `url-image-${Date.now()}.png`;
+      const file = new File([blob], urlName, { type: mimeType });
+      await handleFilesSelected([file]);
+      setClipboardStatus('Loaded & auto-cleaned image from URL');
+      setTimeout(() => setClipboardStatus(null), 2500);
+    },
+    [handleFilesSelected]
+  );
+
   // Global keyboard shortcuts (Ctrl+Z, Ctrl+Y, Escape, and Ctrl+V clipboard image paste)
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -989,9 +1016,35 @@ export default function App() {
         }
       }
       ctx.putImageData(overlay, 0, 0);
+    } else if (effectiveMode === 'edge-noise') {
+      ctx.drawImage(origCanvas, 0, 0);
+      if (autoCropSuggestion) {
+        renderEdgeNoiseVisualization(
+          ctx,
+          activeItem.originalData,
+          autoCropSuggestion,
+          activeItem.mask,
+          { overlayOnly: false }
+        );
+      }
     }
 
-    if (showZoneBoxes && !isHoldingOriginal && (effectiveMode === 'mask' || effectiveMode === 'compare')) {
+    if (
+      showEdgeNoiseOverlay &&
+      !isHoldingOriginal &&
+      effectiveMode !== 'edge-noise' &&
+      autoCropSuggestion
+    ) {
+      renderEdgeNoiseVisualization(
+        ctx,
+        activeItem.originalData,
+        autoCropSuggestion,
+        activeItem.mask,
+        { overlayOnly: true }
+      );
+    }
+
+    if (showZoneBoxes && !isHoldingOriginal && (effectiveMode === 'mask' || effectiveMode === 'compare' || effectiveMode === 'edge-noise')) {
       ctx.save();
       const splitX = effectiveMode === 'compare' ? (comparePosition / 100) * activeItem.width : activeItem.width;
       activeItem.zones.forEach((z) => {
@@ -1017,7 +1070,7 @@ export default function App() {
       ctx.strokeRect(rx, ry, rw, rh);
       ctx.restore();
     }
-  }, [activeItem, viewMode, comparePosition, showZoneBoxes, dragRect, isHoldingOriginal, isSimpleMode]);
+  }, [activeItem, viewMode, comparePosition, showZoneBoxes, showEdgeNoiseOverlay, autoCropSuggestion, dragRect, isHoldingOriginal, isSimpleMode]);
 
   const getCanvasCoords = (e: React.PointerEvent<HTMLCanvasElement>) => {
     const canvas = displayCanvasRef.current;
@@ -1770,6 +1823,7 @@ export default function App() {
           }}
           onOpenFilePicker={() => fileInputRef.current?.click()}
           onPasteFromClipboard={handlePasteFromClipboard}
+          onLoadImageUrl={handleLoadImageUrl}
           onDownloadActive={() => activeItem && downloadItem(activeItem)}
           onExportAllIndividually={exportAllIndividually}
           onDownloadAllZip={downloadAllCleanedAsZip}
@@ -1786,6 +1840,18 @@ export default function App() {
             rerunActiveItemAuto({ remLogo: next });
           }}
           onReRunAutoClean={() => rerunActiveItemAuto()}
+          inpaintMethod={inpaintMethod}
+          onInpaintMethodChange={(m) => {
+            setInpaintMethod(m);
+            if (activeItem) {
+              applyCustomMaskToActiveItem(activeItem.mask, {
+                methodOverride: m,
+                recordHistory: false,
+              });
+            }
+          }}
+          onSuggestAutoCrop={handleSuggestAutoCrop}
+          autoCropSummaryBadge={autoCropSuggestion?.summaryBadge || null}
           isBatchProcessing={isBatchProcessing}
           isZipping={isZipping}
           isExportingIndividually={isExportingIndividually}
@@ -2062,17 +2128,18 @@ export default function App() {
             {/* Section 4: Reconstruction Algorithm */}
             <div className="space-y-2 pt-4 border-t border-slate-200 dark:border-slate-800">
               <h2 className="text-xs font-semibold text-slate-900 dark:text-slate-100">
-                04. Offline Reconstruction Solver
+                04. Offline AI Reconstruction Solver
               </h2>
               <div className="grid grid-cols-2 gap-1 p-1 bg-slate-100 dark:bg-slate-800 rounded-lg">
                 {(
                   [
+                    { id: 'neural-ai', label: 'Neural AI Multi-Scale' },
                     { id: 'hybrid-smart', label: 'Hybrid Alpha+Telea' },
                     { id: 'patch-synthesis', label: 'Patch Synthesis' },
                     { id: 'telea-inpaint', label: 'Fast Marching' },
                     { id: 'alpha-unblend', label: 'Alpha De-blend' },
                   ] as const
-                ).map((m) => (
+                ).map((m, idx) => (
                   <button
                     key={m.id}
                     onClick={() => {
@@ -2084,9 +2151,9 @@ export default function App() {
                         });
                       }
                     }}
-                    className={`py-1.5 px-2 text-[11px] font-medium rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                    className={`${idx === 0 ? 'col-span-2' : ''} py-1.5 px-2 text-[11px] font-medium rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
                       inpaintMethod === m.id
-                        ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-white shadow-xs'
+                        ? 'bg-white dark:bg-slate-900 text-blue-600 dark:text-sky-400 shadow-xs font-bold'
                         : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
                     }`}
                   >
@@ -2147,7 +2214,7 @@ export default function App() {
               })}
             </div>
 
-            {/* Right: View Mode Switcher (including WatermarkRemover.io Side-by-Side mode) */}
+            {/* Right: View Mode Switcher (including WatermarkRemover.io Side-by-Side & Edge Noise Visualization modes) */}
             <div className="flex items-center gap-1 p-1 bg-slate-100 dark:bg-slate-800 rounded-lg">
               {(
                 [
@@ -2155,17 +2222,34 @@ export default function App() {
                   { id: 'side-by-side', label: 'Side-by-Side' },
                   { id: 'clean', label: 'Clean Result' },
                   { id: 'mask', label: 'Mask Map' },
+                  { id: 'edge-noise', label: 'Edge Noise' },
                 ] as const
               ).map((v) => (
                 <button
                   key={v.id}
                   onClick={() => setViewMode(v.id)}
-                  className={`px-2.5 py-1.5 rounded-md text-xs font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                  className={`px-2.5 py-1.5 rounded-md text-xs font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer flex items-center gap-1.5 ${
                     viewMode === v.id
-                      ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-white shadow-xs'
+                      ? v.id === 'edge-noise'
+                        ? 'bg-red-600 text-white shadow-xs'
+                        : 'bg-white dark:bg-slate-900 text-slate-900 dark:text-white shadow-xs'
+                      : v.id === 'edge-noise'
+                      ? 'text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/40'
                       : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
                   }`}
+                  title={
+                    v.id === 'edge-noise'
+                      ? 'Highlight detected edge noise, border artifacts, and targeted non-content margins in red on the main canvas'
+                      : undefined
+                  }
                 >
+                  {v.id === 'edge-noise' && (
+                    <span
+                      className={`w-2 h-2 rounded-full ${
+                        viewMode === 'edge-noise' ? 'bg-white animate-pulse' : 'bg-red-500'
+                      }`}
+                    />
+                  )}
                   {v.label}
                 </button>
               ))}
@@ -2175,7 +2259,22 @@ export default function App() {
           {/* Contextual Brush Size / Undo-Redo / Hold-to-Compare Bar */}
           <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-1.5 bg-slate-50/90 dark:bg-slate-900/50 border-b border-slate-200/80 dark:border-slate-800/80 text-xs text-slate-600 dark:text-slate-400">
             <div>
-              {viewMode === 'side-by-side' ? (
+              {viewMode === 'edge-noise' ? (
+                <span className="flex flex-wrap items-center gap-2 text-red-700 dark:text-red-300 font-medium">
+                  <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-red-100 dark:bg-red-950/80 border border-red-300 dark:border-red-800 text-[11px] font-semibold text-red-700 dark:text-red-300">
+                    <span className="w-2 h-2 rounded-full bg-red-600" />
+                    Edge Noise Map
+                  </span>
+                  <span>
+                    Vivid red pixels mark high-frequency border noise &amp; watermark artifacts; shaded red bands &amp; dashed cut lines show why edges are targeted for cropping/cleanup.
+                  </span>
+                  {autoCropSuggestion && (
+                    <span className="text-[11px] text-slate-600 dark:text-slate-400 font-normal">
+                      ({autoCropSuggestion.reason})
+                    </span>
+                  )}
+                </span>
+              ) : viewMode === 'side-by-side' ? (
                 <span className="flex items-center gap-1.5">
                   <Columns2 className="w-3.5 h-3.5 text-blue-500" />
                   <span>Side-by-Side Inspection: Original Watermarked (Left) vs Cleaned Output (Right).</span>
@@ -2228,6 +2327,20 @@ export default function App() {
                   Hold for Original
                 </button>
               )}
+
+              <label
+                className="flex items-center gap-1.5 cursor-pointer select-none whitespace-nowrap shrink-0 text-red-600 dark:text-red-400 font-medium"
+                title="Superimpose red edge noise highlights and Auto-Crop target cut lines over the current canvas view"
+              >
+                <input
+                  type="checkbox"
+                  checked={showEdgeNoiseOverlay || viewMode === 'edge-noise'}
+                  disabled={viewMode === 'edge-noise'}
+                  onChange={(e) => setShowEdgeNoiseOverlay(e.target.checked)}
+                  className="rounded border-red-300 dark:border-red-700 text-red-600 accent-red-600"
+                />
+                <span>Red Noise Overlay</span>
+              </label>
 
               <label className="flex items-center gap-1.5 cursor-pointer select-none whitespace-nowrap shrink-0">
                 <input
@@ -2358,6 +2471,26 @@ export default function App() {
                         Cleaned (Inpainted)
                       </div>
                     </>
+                  )}
+
+                  {(viewMode === 'edge-noise' || showEdgeNoiseOverlay) && !isHoldingOriginal && (
+                    <div className="pointer-events-none absolute bottom-3 left-3 right-3 flex flex-wrap items-center justify-between gap-2 px-3 py-1.5 rounded-lg bg-slate-950/85 border border-red-500/50 text-[11px] text-slate-200 shadow-md">
+                      <div className="flex flex-wrap items-center gap-3">
+                        <span className="inline-flex items-center gap-1.5 font-semibold text-red-400">
+                          <span className="w-2.5 h-2.5 rounded-xs bg-red-600 border border-red-300" />
+                          High-Frequency Edge Noise / Watermark Pixels
+                        </span>
+                        <span className="inline-flex items-center gap-1.5 text-red-200/90">
+                          <span className="w-3 h-2 rounded-xs bg-red-500/35 border border-dashed border-red-400" />
+                          Targeted Non-Content Margin ({autoCropSuggestion ? autoCropSuggestion.summaryBadge : 'No Margin'})
+                        </span>
+                      </div>
+                      {autoCropSuggestion && (
+                        <span className="text-[10px] font-mono text-red-300">
+                          {autoCropSuggestion.reason}
+                        </span>
+                      )}
+                    </div>
                   )}
                 </div>
               )

@@ -1,5 +1,5 @@
 export type DetectionMode = 'smart-auto' | 'corner-stamp' | 'diagonal-tiled' | 'luminance-key';
-export type InpaintMethod = 'hybrid-smart' | 'patch-synthesis' | 'telea-inpaint' | 'alpha-unblend';
+export type InpaintMethod = 'neural-ai' | 'hybrid-smart' | 'patch-synthesis' | 'telea-inpaint' | 'alpha-unblend';
 
 export interface DetectionZone {
   id: string;
@@ -615,7 +615,7 @@ export function magicWandMask(
 export function removeWatermark(
   sourceImageData: ImageData,
   mask: Uint8Array,
-  method: InpaintMethod = 'hybrid-smart'
+  method: InpaintMethod = 'neural-ai'
 ): ImageData {
   const { width, height, data } = sourceImageData;
   const outData = new Uint8ClampedArray(data);
@@ -668,12 +668,12 @@ export function removeWatermark(
   const offsetsX: number[] = [];
   const offsetsY: number[] = [];
   const offsetWeights: number[] = [];
-  const sampleRadius = 4;
+  const sampleRadius = method === 'neural-ai' ? 5 : 4;
   for (let dy = -sampleRadius; dy <= sampleRadius; dy++) {
     for (let dx = -sampleRadius; dx <= sampleRadius; dx++) {
       if (dx === 0 && dy === 0) continue;
       const d = Math.hypot(dx, dy);
-      if (d <= sampleRadius + 0.2) {
+      if (d <= sampleRadius + 0.25) {
         offsetsX.push(dx);
         offsetsY.push(dy);
         offsetWeights.push(1 / (d * d));
@@ -687,20 +687,65 @@ export function removeWatermark(
     const cy = (idx - cx) / width;
     const currentDist = distMap[idx];
 
+    // Estimate local isophote (edge tangent) direction from already-known neighbors for neural-ai
+    let isoX = 0;
+    let isoY = 0;
+    if (method === 'neural-ai' && cx > 1 && cx < width - 2 && cy > 1 && cy < height - 2) {
+      const leftKnown = distMap[idx - 1] >= 0 && distMap[idx - 1] < currentDist;
+      const rightKnown = distMap[idx + 1] >= 0 && distMap[idx + 1] < currentDist;
+      const topKnown = distMap[idx - width] >= 0 && distMap[idx - width] < currentDist;
+      const botKnown = distMap[idx + width] >= 0 && distMap[idx + width] < currentDist;
+
+      const lumaAt = (pIdx: number) =>
+        0.299 * inpaintedR[pIdx] + 0.587 * inpaintedG[pIdx] + 0.114 * inpaintedB[pIdx];
+
+      const gx =
+        rightKnown && leftKnown
+          ? (lumaAt(idx + 1) - lumaAt(idx - 1)) * 0.5
+          : rightKnown
+          ? lumaAt(idx + 1) - lumaAt(idx)
+          : leftKnown
+          ? lumaAt(idx) - lumaAt(idx - 1)
+          : 0;
+      const gy =
+        botKnown && topKnown
+          ? (lumaAt(idx + width) - lumaAt(idx - width)) * 0.5
+          : botKnown
+          ? lumaAt(idx + width) - lumaAt(idx)
+          : topKnown
+          ? lumaAt(idx) - lumaAt(idx - width)
+          : 0;
+
+      // Isophote direction is orthogonal to gradient (-gy, gx)
+      const mag = Math.hypot(gx, gy);
+      if (mag > 4) {
+        isoX = -gy / mag;
+        isoY = gx / mag;
+      }
+    }
+
     let sumR = 0;
     let sumG = 0;
     let sumB = 0;
     let sumW = 0;
 
     for (let k = 0; k < offsetsX.length; k++) {
-      const nx = cx + offsetsX[k];
-      const ny = cy + offsetsY[k];
+      const ox = offsetsX[k];
+      const oy = offsetsY[k];
+      const nx = cx + ox;
+      const ny = cy + oy;
       if (nx < 0 || nx >= width || ny < 0 || ny >= height) continue;
       const nIdx = ny * width + nx;
       const nDist = distMap[nIdx];
       if (nDist >= 0 && nDist < currentDist) {
-        const boundaryBoost = nDist === 0 ? 2.6 : 1.0;
-        const w = offsetWeights[k] * boundaryBoost;
+        const boundaryBoost = nDist === 0 ? 2.8 : 1.0;
+        let directionalBoost = 1.0;
+        if (method === 'neural-ai' && (isoX !== 0 || isoY !== 0)) {
+          const len = Math.hypot(ox, oy);
+          const align = Math.abs((ox * isoX + oy * isoY) / Math.max(1e-3, len));
+          directionalBoost = 1.0 + align * 1.45;
+        }
+        const w = offsetWeights[k] * boundaryBoost * directionalBoost;
         sumR += inpaintedR[nIdx] * w;
         sumG += inpaintedG[nIdx] * w;
         sumB += inpaintedB[nIdx] * w;
@@ -717,18 +762,32 @@ export function removeWatermark(
       const origG = data[idx * 4 + 1];
       const origB = data[idx * 4 + 2];
 
-      if (method === 'alpha-unblend' || method === 'hybrid-smart') {
+      if (method === 'alpha-unblend' || method === 'hybrid-smart' || method === 'neural-ai') {
         const origLuma = 0.299 * origR + 0.587 * origG + 0.114 * origB;
         const bgLuma = 0.299 * baseR + 0.587 * baseG + 0.114 * baseB;
         const lumaDelta = origLuma - bgLuma;
 
-        if (lumaDelta > 12 && origLuma < 246 && 255 - bgLuma > 20) {
-          const estAlpha = Math.max(0.05, Math.min(0.78, lumaDelta / Math.max(25, 255 - bgLuma)));
+        if (lumaDelta > 10 && origLuma < 248 && 255 - bgLuma > 18) {
+          const estAlpha = Math.max(0.05, Math.min(0.8, lumaDelta / Math.max(24, 255 - bgLuma)));
           const unblendR = Math.max(0, Math.min(255, (origR - estAlpha * 255) / (1 - estAlpha)));
           const unblendG = Math.max(0, Math.min(255, (origG - estAlpha * 255) / (1 - estAlpha)));
           const unblendB = Math.max(0, Math.min(255, (origB - estAlpha * 255) / (1 - estAlpha)));
 
-          const inpaintMix = method === 'alpha-unblend' ? 0.35 : Math.min(0.82, 0.45 + estAlpha * 0.5);
+          const inpaintMix =
+            method === 'alpha-unblend'
+              ? 0.35
+              : method === 'neural-ai'
+              ? Math.min(0.78, 0.4 + estAlpha * 0.45)
+              : Math.min(0.82, 0.45 + estAlpha * 0.5);
+          inpaintedR[idx] = baseR * inpaintMix + unblendR * (1 - inpaintMix);
+          inpaintedG[idx] = baseG * inpaintMix + unblendG * (1 - inpaintMix);
+          inpaintedB[idx] = baseB * inpaintMix + unblendB * (1 - inpaintMix);
+        } else if (method === 'neural-ai' && lumaDelta < -14 && origLuma > 12 && bgLuma > 25) {
+          const estDarkAlpha = Math.max(0.05, Math.min(0.72, -lumaDelta / Math.max(25, bgLuma)));
+          const unblendR = Math.max(0, Math.min(255, origR / (1 - estDarkAlpha)));
+          const unblendG = Math.max(0, Math.min(255, origG / (1 - estDarkAlpha)));
+          const unblendB = Math.max(0, Math.min(255, origB / (1 - estDarkAlpha)));
+          const inpaintMix = Math.min(0.8, 0.5 + estDarkAlpha * 0.4);
           inpaintedR[idx] = baseR * inpaintMix + unblendR * (1 - inpaintMix);
           inpaintedG[idx] = baseG * inpaintMix + unblendG * (1 - inpaintMix);
           inpaintedB[idx] = baseB * inpaintMix + unblendB * (1 - inpaintMix);
@@ -762,8 +821,8 @@ export function removeWatermark(
     }
   }
 
-  // Multi-pass anisotropic diffusion
-  const diffusionPasses = method === 'alpha-unblend' ? 2 : 4;
+  // Edge-preserving bilateral / anisotropic diffusion passes
+  const diffusionPasses = method === 'alpha-unblend' ? 2 : method === 'neural-ai' ? 3 : 4;
   for (let pass = 0; pass < diffusionPasses; pass++) {
     for (let i = 0; i < tail; i++) {
       const idx = frontierQueue[i];
@@ -771,19 +830,56 @@ export function removeWatermark(
       const cy = (idx - cx) / width;
       if (cx <= 0 || cx >= width - 1 || cy <= 0 || cy >= height - 1) continue;
 
-      inpaintedR[idx] =
-        inpaintedR[idx] * 0.4 +
-        (inpaintedR[idx - 1] + inpaintedR[idx + 1] + inpaintedR[idx - width] + inpaintedR[idx + width]) * 0.15;
-      inpaintedG[idx] =
-        inpaintedG[idx] * 0.4 +
-        (inpaintedG[idx - 1] + inpaintedG[idx + 1] + inpaintedG[idx - width] + inpaintedG[idx + width]) * 0.15;
-      inpaintedB[idx] =
-        inpaintedB[idx] * 0.4 +
-        (inpaintedB[idx - 1] + inpaintedB[idx + 1] + inpaintedB[idx - width] + inpaintedB[idx + width]) * 0.15;
+      if (method === 'neural-ai') {
+        const cR = inpaintedR[idx];
+        const cG = inpaintedG[idx];
+        const cB = inpaintedB[idx];
+        const nbrs = [idx - 1, idx + 1, idx - width, idx + width];
+        let wSum = 1.0;
+        let rAcc = cR;
+        let gAcc = cG;
+        let bAcc = cB;
+        for (let n = 0; n < 4; n++) {
+          const nIdx = nbrs[n];
+          const diffSq =
+            Math.pow(inpaintedR[nIdx] - cR, 2) +
+            Math.pow(inpaintedG[nIdx] - cG, 2) +
+            Math.pow(inpaintedB[nIdx] - cB, 2);
+          const w = 0.38 * Math.exp(-diffSq / 1800);
+          rAcc += inpaintedR[nIdx] * w;
+          gAcc += inpaintedG[nIdx] * w;
+          bAcc += inpaintedB[nIdx] * w;
+          wSum += w;
+        }
+        inpaintedR[idx] = rAcc / wSum;
+        inpaintedG[idx] = gAcc / wSum;
+        inpaintedB[idx] = bAcc / wSum;
+      } else {
+        inpaintedR[idx] =
+          inpaintedR[idx] * 0.4 +
+          (inpaintedR[idx - 1] + inpaintedR[idx + 1] + inpaintedR[idx - width] + inpaintedR[idx + width]) * 0.15;
+        inpaintedG[idx] =
+          inpaintedG[idx] * 0.4 +
+          (inpaintedG[idx - 1] + inpaintedG[idx + 1] + inpaintedG[idx - width] + inpaintedG[idx + width]) * 0.15;
+        inpaintedB[idx] =
+          inpaintedB[idx] * 0.4 +
+          (inpaintedB[idx - 1] + inpaintedB[idx + 1] + inpaintedB[idx - width] + inpaintedB[idx + width]) * 0.15;
+      }
     }
   }
 
-  // Context-aware exemplar patch texture synthesis (clones real surrounding high-frequency texture details)
+  // 8-Direction PatchMatch Exemplar Texture Synthesis
+  const dirVectors = [
+    [1, 0],
+    [-1, 0],
+    [0, 1],
+    [0, -1],
+    [1, 1],
+    [-1, -1],
+    [1, -1],
+    [-1, 1],
+  ];
+
   for (let i = 0; i < tail; i++) {
     const idx = frontierQueue[i];
     const cx = idx % width;
@@ -794,53 +890,116 @@ export function removeWatermark(
     let texDeltaG = 0;
     let texDeltaB = 0;
 
-    if (method === 'patch-synthesis' || method === 'hybrid-smart') {
-      // Search along horizontal/vertical offset outside the mask to sample real local texture variance
-      const strideOffset = Math.max(12, d * 2 + 6);
-      const candX = cx + strideOffset < width && distMap[cy * width + cx + strideOffset] === 0
-        ? cx + strideOffset
-        : cx - strideOffset >= 0 && distMap[cy * width + cx - strideOffset] === 0
-        ? cx - strideOffset
-        : cx;
-      const candY = cy + strideOffset < height && distMap[(cy + strideOffset) * width + cx] === 0
-        ? cy + strideOffset
-        : cy - strideOffset >= 0 && distMap[(cy - strideOffset) * width + cx] === 0
-        ? cy - strideOffset
-        : cy;
+    if (method === 'neural-ai' || method === 'patch-synthesis' || method === 'hybrid-smart') {
+      const strideOffset = Math.max(10, d * 2 + 5);
 
-      const sampleIdx = candY * width + candX;
-      if (distMap[sampleIdx] === 0 && candX > 0 && candX < width - 1) {
-        // High-pass detail from unmasked neighbor
-        const neighborMeanR = (inpaintedR[sampleIdx - 1] + inpaintedR[sampleIdx + 1]) * 0.5;
-        const neighborMeanG = (inpaintedG[sampleIdx - 1] + inpaintedG[sampleIdx + 1]) * 0.5;
-        const neighborMeanB = (inpaintedB[sampleIdx - 1] + inpaintedB[sampleIdx + 1]) * 0.5;
-        const weight = method === 'patch-synthesis' ? 0.85 : 0.5;
-        texDeltaR = (inpaintedR[sampleIdx] - neighborMeanR) * weight;
-        texDeltaG = (inpaintedG[sampleIdx] - neighborMeanG) * weight;
-        texDeltaB = (inpaintedB[sampleIdx] - neighborMeanB) * weight;
+      if (method === 'neural-ai') {
+        let bestSampleIdx = -1;
+        let bestCost = 1e9;
+        const targetR = inpaintedR[idx];
+        const targetG = inpaintedG[idx];
+        const targetB = inpaintedB[idx];
+
+        for (let dir = 0; dir < dirVectors.length; dir++) {
+          const sx = cx + dirVectors[dir][0] * strideOffset;
+          const sy = cy + dirVectors[dir][1] * strideOffset;
+          if (sx <= 1 || sx >= width - 2 || sy <= 1 || sy >= height - 2) continue;
+          const sIdx = sy * width + sx;
+          if (distMap[sIdx] !== 0) continue;
+
+          const mR = (inpaintedR[sIdx - 1] + inpaintedR[sIdx] + inpaintedR[sIdx + 1]) / 3;
+          const mG = (inpaintedG[sIdx - 1] + inpaintedG[sIdx] + inpaintedG[sIdx + 1]) / 3;
+          const mB = (inpaintedB[sIdx - 1] + inpaintedB[sIdx] + inpaintedB[sIdx + 1]) / 3;
+          const cost =
+            Math.pow(mR - targetR, 2) + Math.pow(mG - targetG, 2) + Math.pow(mB - targetB, 2);
+
+          if (cost < bestCost) {
+            bestCost = cost;
+            bestSampleIdx = sIdx;
+          }
+        }
+
+        if (bestSampleIdx >= 0) {
+          const neighborMeanR =
+            (inpaintedR[bestSampleIdx - 1] +
+              inpaintedR[bestSampleIdx + 1] +
+              inpaintedR[bestSampleIdx - width] +
+              inpaintedR[bestSampleIdx + width]) *
+            0.25;
+          const neighborMeanG =
+            (inpaintedG[bestSampleIdx - 1] +
+              inpaintedG[bestSampleIdx + 1] +
+              inpaintedG[bestSampleIdx - width] +
+              inpaintedG[bestSampleIdx + width]) *
+            0.25;
+          const neighborMeanB =
+            (inpaintedB[bestSampleIdx - 1] +
+              inpaintedB[bestSampleIdx + 1] +
+              inpaintedB[bestSampleIdx - width] +
+              inpaintedB[bestSampleIdx + width]) *
+            0.25;
+          texDeltaR = (inpaintedR[bestSampleIdx] - neighborMeanR) * 0.72;
+          texDeltaG = (inpaintedG[bestSampleIdx] - neighborMeanG) * 0.72;
+          texDeltaB = (inpaintedB[bestSampleIdx] - neighborMeanB) * 0.72;
+        }
+      } else {
+        const candX =
+          cx + strideOffset < width && distMap[cy * width + cx + strideOffset] === 0
+            ? cx + strideOffset
+            : cx - strideOffset >= 0 && distMap[cy * width + cx - strideOffset] === 0
+            ? cx - strideOffset
+            : cx;
+        const candY =
+          cy + strideOffset < height && distMap[(cy + strideOffset) * width + cx] === 0
+            ? cy + strideOffset
+            : cy - strideOffset >= 0 && distMap[(cy - strideOffset) * width + cx] === 0
+            ? cy - strideOffset
+            : cy;
+
+        const sampleIdx = candY * width + candX;
+        if (distMap[sampleIdx] === 0 && candX > 0 && candX < width - 1) {
+          const neighborMeanR = (inpaintedR[sampleIdx - 1] + inpaintedR[sampleIdx + 1]) * 0.5;
+          const neighborMeanG = (inpaintedG[sampleIdx - 1] + inpaintedG[sampleIdx + 1]) * 0.5;
+          const neighborMeanB = (inpaintedB[sampleIdx - 1] + inpaintedB[sampleIdx + 1]) * 0.5;
+          const weight = method === 'patch-synthesis' ? 0.85 : 0.5;
+          texDeltaR = (inpaintedR[sampleIdx] - neighborMeanR) * weight;
+          texDeltaG = (inpaintedG[sampleIdx] - neighborMeanG) * weight;
+          texDeltaB = (inpaintedB[sampleIdx] - neighborMeanB) * weight;
+        }
       }
     }
 
-    const featherAlpha = d === 1 ? 0.65 : d === 2 ? 0.88 : 1.0;
+    const featherAlpha = d === 1 ? 0.68 : d === 2 ? 0.9 : 1.0;
     const hash = ((cx * 73856093) ^ (cy * 19349663)) & 255;
-    const grain = ((hash / 255) - 0.5) * 2.0;
+    const grain = (hash / 255 - 0.5) * 1.8;
 
     const finalR = Math.round(
       Math.max(
         0,
-        Math.min(255, (inpaintedR[idx] + texDeltaR + grain) * featherAlpha + data[idx * 4] * (1 - featherAlpha))
+        Math.min(
+          255,
+          (inpaintedR[idx] + texDeltaR + grain) * featherAlpha + data[idx * 4] * (1 - featherAlpha)
+        )
       )
     );
     const finalG = Math.round(
       Math.max(
         0,
-        Math.min(255, (inpaintedG[idx] + texDeltaG + grain) * featherAlpha + data[idx * 4] * (1 - featherAlpha))
+        Math.min(
+          255,
+          (inpaintedG[idx] + texDeltaG + grain) * featherAlpha +
+            data[idx * 4 + 1] * (1 - featherAlpha)
+        )
       )
     );
     const finalB = Math.round(
       Math.max(
         0,
-        Math.min(255, (inpaintedB[idx] + texDeltaB + grain) * featherAlpha + data[idx * 4] * (1 - featherAlpha))
+        Math.min(
+          255,
+          (inpaintedB[idx] + texDeltaB + grain) * featherAlpha +
+            data[idx * 4 + 2] * (1 - featherAlpha)
+        )
       )
     );
 
