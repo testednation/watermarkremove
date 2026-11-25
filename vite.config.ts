@@ -47,6 +47,20 @@ export default defineConfig(() => {
           globPatterns: ['**/*.{js,css,html,ico,png,svg,woff,woff2}'],
           runtimeCaching: [
             {
+              urlPattern: /\/ort-wasm\/.*\.(wasm|mjs)$/i,
+              handler: 'CacheFirst',
+              options: {
+                cacheName: 'ort-wasm-runtime-cache',
+                expiration: {
+                  maxEntries: 16,
+                  maxAgeSeconds: 60 * 60 * 24 * 365,
+                },
+                cacheableResponse: {
+                  statuses: [0, 200],
+                },
+              },
+            },
+            {
               urlPattern: /^https:\/\/fonts\.googleapis\.com\/.*/i,
               handler: 'CacheFirst',
               options: {
@@ -82,6 +96,10 @@ export default defineConfig(() => {
         },
       }),
     ],
+    optimizeDeps: {
+      exclude: ['onnxruntime-web'],
+    },
+    assetsInclude: ['**/*.onnx'],
     resolve: {
       alias: {
         '@': path.resolve(__dirname, '.'),

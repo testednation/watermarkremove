@@ -30,6 +30,13 @@ import { DetectionZone, InpaintMethod } from '../lib/watermarkEngine';
 import { OptimizeFormat } from '../lib/optimizer';
 import { ExportPresetsDropdown } from './ExportPresetsDropdown';
 
+import {
+  OfflineAiModelId,
+  OFFLINE_AI_MODELS,
+  ExecutionBackend,
+  OfflineAiDownloadProgress,
+} from '../lib/offlineAiEngine';
+
 export interface SimpleQueueItem {
   id: string;
   name: string;
@@ -42,6 +49,7 @@ export interface SimpleQueueItem {
   processingMs: number;
   status: 'cleaned' | 'processing';
   quality?: ReconstructionQuality;
+  usedAiModel?: OfflineAiModelId | null;
 }
 
 interface SimpleBatchProgress {
@@ -73,6 +81,10 @@ interface SimpleModeWorkspaceProps {
   onReRunAutoClean: () => void;
   inpaintMethod?: InpaintMethod;
   onInpaintMethodChange?: (method: InpaintMethod) => void;
+  activeAiModelId?: OfflineAiModelId | null;
+  activeAiBackend?: ExecutionBackend | null;
+  aiDownloadProgress?: OfflineAiDownloadProgress | null;
+  onOpenAiManager?: () => void;
   onSuggestAutoCrop?: () => void;
   autoCropSummaryBadge?: string | null;
   isBatchProcessing: boolean;
@@ -109,6 +121,10 @@ export const SimpleModeWorkspace: React.FC<SimpleModeWorkspaceProps> = ({
   onReRunAutoClean,
   inpaintMethod = 'neural-ai',
   onInpaintMethodChange,
+  activeAiModelId = null,
+  activeAiBackend = null,
+  aiDownloadProgress = null,
+  onOpenAiManager,
   onSuggestAutoCrop,
   autoCropSummaryBadge,
   isBatchProcessing,
@@ -190,13 +206,43 @@ export const SimpleModeWorkspace: React.FC<SimpleModeWorkspaceProps> = ({
                 <h1 className="text-lg md:text-xl font-bold text-slate-900 dark:text-white tracking-tight">
                   Offline AI Watermark Remover
                 </h1>
-                <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 border border-emerald-500/30">
-                  <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
-                  100% Local Offline AI Engine
-                </span>
+                {onOpenAiManager && (
+                  <button
+                    type="button"
+                    onClick={onOpenAiManager}
+                    className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-semibold border transition-colors cursor-pointer ${
+                      aiDownloadProgress
+                        ? 'bg-blue-500/15 text-blue-700 dark:text-sky-300 border-blue-500/30'
+                        : activeAiModelId
+                        ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 border-emerald-500/30 hover:bg-emerald-500/25'
+                        : 'bg-amber-500/15 text-amber-700 dark:text-amber-300 border-amber-500/30 hover:bg-amber-500/25'
+                    }`}
+                    title="Manage or download cached Offline ONNX Neural AI models"
+                  >
+                    {aiDownloadProgress ? (
+                      <>
+                        <Loader2 className="w-3 h-3 animate-spin" />
+                        <span>Downloading AI {aiDownloadProgress.percent}%</span>
+                      </>
+                    ) : activeAiModelId ? (
+                      <>
+                        <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+                        <span>
+                          Offline AI Ready: {OFFLINE_AI_MODELS[activeAiModelId].shortName}
+                          {activeAiBackend ? ` · ${activeAiBackend}` : ''}
+                        </span>
+                      </>
+                    ) : (
+                      <>
+                        <Download className="w-3 h-3" />
+                        <span>Download Offline AI (28 MB)</span>
+                      </>
+                    )}
+                  </button>
+                )}
               </div>
               <p className="text-xs md:text-sm text-slate-500 dark:text-slate-400 mt-0.5">
-                Drop, upload, paste (Ctrl+V), or enter an image URL — multi-scale AI inpainting runs locally in your browser.
+                Drop, upload, paste (Ctrl+V), or enter an image URL — automatic watermark detection &amp; offline neural AI removal in your browser.
               </p>
             </div>
           </div>
@@ -429,10 +475,22 @@ export const SimpleModeWorkspace: React.FC<SimpleModeWorkspaceProps> = ({
             {/* Preview Top Bar with WatermarkRemover.io Side-by-Side, Split Slider, Clean Result & Magnifier */}
             <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-3 border-b border-slate-200 dark:border-slate-800 bg-white/80 dark:bg-slate-900/80">
               <div className="flex items-center gap-2 flex-wrap">
-                <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-xl text-xs font-bold bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 border border-emerald-500/25">
-                  <Sparkles className="w-3.5 h-3.5" />
-                  Cleaned in {activeItem.processingMs}ms
-                </span>
+                {activeItem.status === 'processing' ? (
+                  <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-xl text-xs font-bold bg-blue-500/15 text-blue-700 dark:text-sky-300 border border-blue-500/30">
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    <span>Running Offline AI...</span>
+                  </span>
+                ) : (
+                  <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-xl text-xs font-bold bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 border border-emerald-500/25">
+                    <Sparkles className="w-3.5 h-3.5" />
+                    <span>
+                      Cleaned in {activeItem.processingMs}ms
+                      {activeItem.usedAiModel
+                        ? ` · ${OFFLINE_AI_MODELS[activeItem.usedAiModel].shortName}`
+                        : ''}
+                    </span>
+                  </span>
+                )}
                 <span className="text-xs font-medium text-slate-600 dark:text-slate-400 font-mono">
                   {activeItem.width}×{activeItem.height}px · {activeItem.zones.length}{' '}
                   {activeItem.zones.length === 1 ? 'watermark' : 'watermarks'} removed

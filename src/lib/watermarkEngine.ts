@@ -1,3 +1,5 @@
+import { inpaintWithOfflineAiModel, OfflineAiModelId } from './offlineAiEngine';
+
 export type DetectionMode = 'smart-auto' | 'corner-stamp' | 'diagonal-tiled' | 'luminance-key';
 export type InpaintMethod = 'neural-ai' | 'hybrid-smart' | 'patch-synthesis' | 'telea-inpaint' | 'alpha-unblend';
 
@@ -1011,3 +1013,45 @@ export function removeWatermark(
 
   return new ImageData(outData, width, height);
 }
+
+export interface AsyncRemoveResult {
+  imageData: ImageData;
+  usedOfflineAiModel: OfflineAiModelId | null;
+}
+
+/**
+ * Asynchronous watermark removal pipeline: uses the downloaded offline ONNX neural model
+ * when active and cached, and seamlessly falls back to fast local DSP/PatchMatch synthesis if needed.
+ */
+export async function removeWatermarkAsync(
+  sourceImageData: ImageData,
+  mask: Uint8Array,
+  method: InpaintMethod = 'neural-ai',
+  offlineAi?: {
+    modelId: OfflineAiModelId | null;
+    tensorMode?: 'migan-uint8' | 'lama-float32';
+  }
+): Promise<AsyncRemoveResult> {
+  if (method === 'neural-ai' && offlineAi?.modelId) {
+    try {
+      const neuralOut = await inpaintWithOfflineAiModel(
+        sourceImageData,
+        mask,
+        offlineAi.modelId,
+        offlineAi.tensorMode
+      );
+      return {
+        imageData: neuralOut,
+        usedOfflineAiModel: offlineAi.modelId,
+      };
+    } catch (err) {
+      console.warn('Offline ONNX neural inference fell back to fast local engine:', err);
+    }
+  }
+
+  return {
+    imageData: removeWatermark(sourceImageData, mask, method),
+    usedOfflineAiModel: null,
+  };
+}
+

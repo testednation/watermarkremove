@@ -35,11 +35,13 @@ import {
   PenLine,
   HelpCircle,
   FileDown,
+  Cpu,
 } from 'lucide-react';
 import JSZip from 'jszip';
 import {
   autoDetectWatermarkMask,
   removeWatermark,
+  removeWatermarkAsync,
   dilateMask,
   magicWandMask,
   extractDetectionZones,
@@ -47,12 +49,25 @@ import {
   InpaintMethod,
   DetectionZone,
 } from './lib/watermarkEngine';
+import {
+  OfflineAiModelId,
+  CachedModelMetadata,
+  OfflineAiDownloadProgress,
+  ExecutionBackend,
+  OFFLINE_AI_MODELS,
+  getAllCachedModelsMeta,
+  loadOfflineAiSession,
+  downloadOfflineAiModel,
+  deleteCachedOfflineAiModel,
+  importLocalOnnxModelFile,
+} from './lib/offlineAiEngine';
 import { OFFLINE_SAMPLES, SamplePreset } from './lib/sampleGenerator';
 import { PWAInstallButton } from './components/PWAInstallButton';
 import { useOnlineStatus } from './hooks/useOnlineStatus';
 import { BulkCropModal } from './components/BulkCropModal';
 import { BatchRenameModal } from './components/BatchRenameModal';
 import { KeyboardShortcutsModal } from './components/KeyboardShortcutsModal';
+import { OfflineAiDownloadModal } from './components/OfflineAiDownloadModal';
 import { SimpleModeWorkspace } from './components/SimpleModeWorkspace';
 import { ExportPresetsDropdown } from './components/ExportPresetsDropdown';
 import {
@@ -99,6 +114,7 @@ interface QueueItem {
   cleanedUrl: string;
   status: 'cleaned' | 'processing';
   quality?: ReconstructionQuality;
+  usedAiModel?: OfflineAiModelId | null;
 }
 
 function imageDataToDataUrl(imgData: ImageData): string {
@@ -117,6 +133,8 @@ export default function App() {
 
   // Queue & active image state
   const [queue, setQueue] = useState<QueueItem[]>([]);
+  const queueRef = useRef<QueueItem[]>(queue);
+  queueRef.current = queue;
   const [activeId, setActiveId] = useState<string | null>(null);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [isDraggingOver, setIsDraggingOver] = useState(false);
@@ -161,6 +179,17 @@ export default function App() {
   const [smartOptimize, setSmartOptimize] = useState<boolean>(true);
   const [optimizeFormat, setOptimizeFormat] = useState<OptimizeFormat>('webp');
   const [optimizeQuality, setOptimizeQuality] = useState<number>(0.88);
+
+  // Offline ONNX Neural AI state & IndexedDB model cache
+  const [cachedAiModels, setCachedAiModels] = useState<CachedModelMetadata[]>([]);
+  const [activeAiModelId, setActiveAiModelId] = useState<OfflineAiModelId | null>(null);
+  const [activeAiBackend, setActiveAiBackend] = useState<ExecutionBackend | null>(null);
+  const [showAiDownloadModal, setShowAiDownloadModal] = useState<boolean>(false);
+  const [hasPendingAiPrompt, setHasPendingAiPrompt] = useState<boolean>(false);
+  const [aiDownloadProgress, setAiDownloadProgress] = useState<OfflineAiDownloadProgress | null>(null);
+  const [aiDownloadError, setAiDownloadError] = useState<string | null>(null);
+  const aiDownloadAbortRef = useRef<AbortController | null>(null);
+  const hasDismissedAiPromptRef = useRef<boolean>(false);
 
   // Item selection helpers for Batch Queue operations
   const toggleSelectItem = useCallback((id: string) => {
@@ -253,9 +282,15 @@ export default function App() {
     }
   }, [isDark]);
 
-  // Process a raw ImageData automatically with current engine settings
+  // Helper to get active tensor mode if using custom-local or downloaded model
+  const activeAiTensorMode = useMemo(() => {
+    if (!activeAiModelId) return undefined;
+    return cachedAiModels.find((m) => m.id === activeAiModelId)?.tensorMode;
+  }, [activeAiModelId, cachedAiModels]);
+
+  // Process a raw ImageData automatically with current engine settings (uses Offline ONNX AI when ready)
   const runAutomaticPipeline = useCallback(
-    (
+    async (
       origData: ImageData,
       overrides?: {
         mode?: DetectionMode;
@@ -265,6 +300,8 @@ export default function App() {
         corners?: typeof targetCorners;
         remText?: boolean;
         remLogo?: boolean;
+        forceAiModelId?: OfflineAiModelId | null;
+        forceAiTensorMode?: 'migan-uint8' | 'lama-float32';
       }
     ) => {
       const t0 = performance.now();
@@ -277,33 +314,261 @@ export default function App() {
         targetCorners: overrides?.corners ?? targetCorners,
       });
 
-      const cleaned = removeWatermark(
+      const modelToUse =
+        overrides?.forceAiModelId !== undefined ? overrides.forceAiModelId : activeAiModelId;
+      const tensorModeToUse =
+        overrides?.forceAiTensorMode !== undefined
+          ? overrides.forceAiTensorMode
+          : activeAiTensorMode;
+
+      const res = await removeWatermarkAsync(
         origData,
         det.mask,
-        overrides?.method ?? inpaintMethod
+        overrides?.method ?? inpaintMethod,
+        {
+          modelId: modelToUse,
+          tensorMode: tensorModeToUse,
+        }
       );
-      const quality = computeReconstructionQuality(origData, cleaned, det.mask);
+      const quality = computeReconstructionQuality(origData, res.imageData, det.mask);
       const t1 = performance.now();
 
       return {
         mask: det.mask,
         zones: det.zones,
         coveragePercent: det.coveragePercent,
-        cleanedData: cleaned,
-        cleanedUrl: imageDataToDataUrl(cleaned),
+        cleanedData: res.imageData,
+        cleanedUrl: imageDataToDataUrl(res.imageData),
         processingMs: Math.max(1, Math.round(t1 - t0)),
         quality,
+        usedAiModel: res.usedOfflineAiModel,
       };
     },
-    [detectionMode, sensitivity, dilationRadius, inpaintMethod, targetCorners, removeText, removeLogo]
+    [
+      detectionMode,
+      sensitivity,
+      dilationRadius,
+      inpaintMethod,
+      targetCorners,
+      removeText,
+      removeLogo,
+      activeAiModelId,
+      activeAiTensorMode,
+    ]
+  );
+
+  // Prompt the user to download Offline AI if not cached yet (non-blocking)
+  const maybePromptForOfflineAi = useCallback(() => {
+    if (activeAiModelId || aiDownloadProgress || hasDismissedAiPromptRef.current) return;
+    if (cachedAiModels.length > 0) return;
+    setHasPendingAiPrompt(true);
+    setShowAiDownloadModal(true);
+  }, [activeAiModelId, aiDownloadProgress, cachedAiModels.length]);
+
+  // Re-run all items currently in queue using newly downloaded / activated Offline AI model
+  const recleanQueueWithAiModel = useCallback(
+    async (modelId: OfflineAiModelId, tensorMode?: 'migan-uint8' | 'lama-float32') => {
+      const snapshot = [...queueRef.current];
+      for (const target of snapshot) {
+        setQueue((prev) =>
+          prev.map((q) => (q.id === target.id ? { ...q, status: 'processing' } : q))
+        );
+        const res = await runAutomaticPipeline(target.originalData, {
+          method: 'neural-ai',
+          forceAiModelId: modelId,
+          forceAiTensorMode: tensorMode,
+        });
+        setQueue((prev) =>
+          prev.map((q) =>
+            q.id === target.id
+              ? {
+                  ...q,
+                  mask: res.mask,
+                  zones: res.zones,
+                  coveragePercent: res.coveragePercent,
+                  cleanedData: res.cleanedData,
+                  cleanedUrl: res.cleanedUrl,
+                  processingMs: res.processingMs,
+                  quality: res.quality,
+                  usedAiModel: res.usedAiModel,
+                  status: 'cleaned',
+                }
+              : q
+          )
+        );
+      }
+    },
+    [runAutomaticPipeline]
+  );
+
+  // Check IndexedDB on mount to see if Offline Neural AI weights are already cached
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const metas = await getAllCachedModelsMeta();
+      if (cancelled) return;
+      setCachedAiModels(metas);
+      if (metas.length > 0) {
+        const preferred = localStorage.getItem('clearframe_preferred_ai_model') as OfflineAiModelId | null;
+        const chosenMeta =
+          (preferred && metas.find((m) => m.id === preferred)) ||
+          metas.find((m) => m.id === 'migan-v2') ||
+          metas[0];
+        if (chosenMeta) {
+          try {
+            const loaded = await loadOfflineAiSession(chosenMeta.id);
+            if (cancelled) return;
+            setActiveAiModelId(loaded.modelId);
+            setActiveAiBackend(loaded.backend);
+            await recleanQueueWithAiModel(loaded.modelId, chosenMeta.tensorMode);
+          } catch (err) {
+            console.warn('Failed to pre-warm cached Offline AI model:', err);
+          }
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Download selected ONNX Offline AI model from HuggingFace & cache to IndexedDB
+  const handleStartDownloadAiModel = useCallback(
+    async (modelId: OfflineAiModelId) => {
+      if (aiDownloadProgress) return;
+      setAiDownloadError(null);
+      const controller = new AbortController();
+      aiDownloadAbortRef.current = controller;
+
+      setAiDownloadProgress({
+        modelId,
+        phase: 'downloading',
+        loadedBytes: 0,
+        totalBytes: OFFLINE_AI_MODELS[modelId].sizeBytes,
+        percent: 0,
+      });
+
+      try {
+        const { meta, backend } = await downloadOfflineAiModel(
+          modelId,
+          (progress) => setAiDownloadProgress(progress),
+          controller.signal
+        );
+        const metas = await getAllCachedModelsMeta();
+        setCachedAiModels(metas);
+        setActiveAiModelId(modelId);
+        setActiveAiBackend(backend);
+        setInpaintMethod('neural-ai');
+        localStorage.setItem('clearframe_preferred_ai_model', modelId);
+        setAiDownloadProgress(null);
+        setShowAiDownloadModal(false);
+        setHasPendingAiPrompt(false);
+        await recleanQueueWithAiModel(modelId, meta.tensorMode);
+      } catch (err) {
+        setAiDownloadProgress(null);
+        if ((err as Error)?.name === 'AbortError') {
+          setAiDownloadError('Download canceled. You can resume anytime.');
+        } else {
+          setAiDownloadError(
+            err instanceof Error
+              ? err.message
+              : 'Failed to download Offline AI weights. Check your connection or load a local .onnx file.'
+          );
+        }
+      } finally {
+        aiDownloadAbortRef.current = null;
+      }
+    },
+    [aiDownloadProgress, recleanQueueWithAiModel]
+  );
+
+  const handleCancelAiDownload = useCallback(() => {
+    aiDownloadAbortRef.current?.abort();
+  }, []);
+
+  const handleSelectAndActivateAiModel = useCallback(
+    async (modelId: OfflineAiModelId) => {
+      setAiDownloadError(null);
+      try {
+        const loaded = await loadOfflineAiSession(modelId);
+        const metas = await getAllCachedModelsMeta();
+        setCachedAiModels(metas);
+        setActiveAiModelId(loaded.modelId);
+        setActiveAiBackend(loaded.backend);
+        setInpaintMethod('neural-ai');
+        localStorage.setItem('clearframe_preferred_ai_model', modelId);
+        setShowAiDownloadModal(false);
+        setHasPendingAiPrompt(false);
+        const meta = metas.find((m) => m.id === modelId);
+        await recleanQueueWithAiModel(loaded.modelId, meta?.tensorMode);
+      } catch (err) {
+        setAiDownloadError(
+          err instanceof Error ? err.message : 'Unable to activate cached Offline AI model.'
+        );
+      }
+    },
+    [recleanQueueWithAiModel]
+  );
+
+  const handleDeleteCachedAiModel = useCallback(
+    async (modelId: OfflineAiModelId) => {
+      await deleteCachedOfflineAiModel(modelId);
+      const metas = await getAllCachedModelsMeta();
+      setCachedAiModels(metas);
+      if (activeAiModelId === modelId) {
+        if (metas.length > 0) {
+          const fallback = metas[0];
+          try {
+            const loaded = await loadOfflineAiSession(fallback.id);
+            setActiveAiModelId(loaded.modelId);
+            setActiveAiBackend(loaded.backend);
+            localStorage.setItem('clearframe_preferred_ai_model', loaded.modelId);
+          } catch {
+            setActiveAiModelId(null);
+            setActiveAiBackend(null);
+          }
+        } else {
+          setActiveAiModelId(null);
+          setActiveAiBackend(null);
+          localStorage.removeItem('clearframe_preferred_ai_model');
+        }
+      }
+    },
+    [activeAiModelId]
+  );
+
+  const handleImportLocalOnnxModel = useCallback(
+    async (file: File) => {
+      setAiDownloadError(null);
+      try {
+        const { meta, backend } = await importLocalOnnxModelFile(file);
+        const metas = await getAllCachedModelsMeta();
+        setCachedAiModels(metas);
+        setActiveAiModelId('custom-local');
+        setActiveAiBackend(backend);
+        setInpaintMethod('neural-ai');
+        localStorage.setItem('clearframe_preferred_ai_model', 'custom-local');
+        setShowAiDownloadModal(false);
+        setHasPendingAiPrompt(false);
+        await recleanQueueWithAiModel('custom-local', meta.tensorMode);
+      } catch (err) {
+        setAiDownloadError(
+          err instanceof Error ? err.message : 'Failed to load custom .onnx model file.'
+        );
+      }
+    },
+    [recleanQueueWithAiModel]
   );
 
   // Load a sample preset by ID
   const loadSamplePreset = useCallback(
-    (sample: SamplePreset) => {
+    (sample: SamplePreset, fromUserAction: boolean = true) => {
+      if (fromUserAction) {
+        maybePromptForOfflineAi();
+      }
       const dataUrl = sample.renderToDataUrl();
       const img = new Image();
-      img.onload = () => {
+      img.onload = async () => {
         const c = document.createElement('canvas');
         c.width = img.width;
         c.height = img.height;
@@ -311,7 +576,7 @@ export default function App() {
         ctx.drawImage(img, 0, 0);
         const origData = ctx.getImageData(0, 0, img.width, img.height);
 
-        const result = runAutomaticPipeline(origData, { mode: sample.recommendedMode });
+        const result = await runAutomaticPipeline(origData, { mode: sample.recommendedMode });
         const newItem: QueueItem = {
           id: `${sample.id}-${Date.now()}`,
           name: `${sample.title}.png`,
@@ -329,6 +594,7 @@ export default function App() {
           cleanedUrl: result.cleanedUrl,
           status: 'cleaned',
           quality: result.quality,
+          usedAiModel: result.usedAiModel,
         };
 
         setDetectionMode(sample.recommendedMode);
@@ -338,19 +604,19 @@ export default function App() {
       };
       img.src = dataUrl;
     },
-    [runAutomaticPipeline]
+    [runAutomaticPipeline, maybePromptForOfflineAi]
   );
 
   // Initialize with the first offline sample on mount
   useEffect(() => {
     if (queue.length === 0 && OFFLINE_SAMPLES.length > 0) {
-      loadSamplePreset(OFFLINE_SAMPLES[0]);
+      loadSamplePreset(OFFLINE_SAMPLES[0], false);
     }
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Re-run automatic detection & removal on the active item when sliders, toggles, or mode change
   const rerunActiveItemAuto = useCallback(
-    (overrides?: {
+    async (overrides?: {
       mode?: DetectionMode;
       sens?: number;
       dilate?: number;
@@ -360,10 +626,14 @@ export default function App() {
       remLogo?: boolean;
     }) => {
       if (!activeItem) return;
-      const res = runAutomaticPipeline(activeItem.originalData, overrides);
+      const targetId = activeItem.id;
+      setQueue((prev) =>
+        prev.map((item) => (item.id === targetId ? { ...item, status: 'processing' } : item))
+      );
+      const res = await runAutomaticPipeline(activeItem.originalData, overrides);
       setQueue((prev) =>
         prev.map((item) =>
-          item.id === activeItem.id
+          item.id === targetId
             ? {
                 ...item,
                 undoStack: [...item.undoStack.slice(-24), new Uint8Array(item.mask)],
@@ -375,6 +645,8 @@ export default function App() {
                 cleanedUrl: res.cleanedUrl,
                 processingMs: res.processingMs,
                 quality: res.quality,
+                usedAiModel: res.usedAiModel,
+                status: 'cleaned',
               }
             : item
         )
@@ -385,18 +657,39 @@ export default function App() {
 
   // Re-inpaint active item using a custom modified mask
   const applyCustomMaskToActiveItem = useCallback(
-    (
+    async (
       newMask: Uint8Array,
-      options?: { methodOverride?: InpaintMethod; recordHistory?: boolean }
+      options?: { methodOverride?: InpaintMethod; recordHistory?: boolean; fastPreview?: boolean }
     ) => {
       if (!activeItem) return;
       const recordHistory = options?.recordHistory ?? true;
+      const fastPreview = options?.fastPreview ?? false;
+      const targetId = activeItem.id;
       const t0 = performance.now();
-      const cleaned = removeWatermark(
-        activeItem.originalData,
-        newMask,
-        options?.methodOverride ?? inpaintMethod
-      );
+
+      let cleaned: ImageData;
+      let usedAiModel: OfflineAiModelId | null = null;
+
+      if (fastPreview) {
+        cleaned = removeWatermark(
+          activeItem.originalData,
+          newMask,
+          options?.methodOverride ?? inpaintMethod
+        );
+      } else {
+        const res = await removeWatermarkAsync(
+          activeItem.originalData,
+          newMask,
+          options?.methodOverride ?? inpaintMethod,
+          {
+            modelId: activeAiModelId,
+            tensorMode: activeAiTensorMode,
+          }
+        );
+        cleaned = res.imageData;
+        usedAiModel = res.usedOfflineAiModel;
+      }
+
       const quality = computeReconstructionQuality(activeItem.originalData, cleaned, newMask);
       const t1 = performance.now();
       const totalPixels = activeItem.width * activeItem.height;
@@ -409,7 +702,7 @@ export default function App() {
 
       setQueue((prev) =>
         prev.map((item) =>
-          item.id === activeItem.id
+          item.id === targetId
             ? {
                 ...item,
                 undoStack: recordHistory
@@ -423,24 +716,30 @@ export default function App() {
                 cleanedUrl: imageDataToDataUrl(cleaned),
                 processingMs: Math.max(1, Math.round(t1 - t0)),
                 quality,
+                usedAiModel,
+                status: 'cleaned',
               }
             : item
         )
       );
     },
-    [activeItem, inpaintMethod]
+    [activeItem, inpaintMethod, activeAiModelId, activeAiTensorMode]
   );
 
   // Undo last mask modification on the active item
-  const undoMask = useCallback(() => {
+  const undoMask = useCallback(async () => {
     if (!activeItem || activeItem.undoStack.length === 0) return;
+    const targetId = activeItem.id;
     const previousMask = activeItem.undoStack[activeItem.undoStack.length - 1];
     const nextUndoStack = activeItem.undoStack.slice(0, -1);
     const nextRedoStack = [...activeItem.redoStack, new Uint8Array(activeItem.mask)];
 
     const t0 = performance.now();
-    const cleaned = removeWatermark(activeItem.originalData, previousMask, inpaintMethod);
-    const quality = computeReconstructionQuality(activeItem.originalData, cleaned, previousMask);
+    const res = await removeWatermarkAsync(activeItem.originalData, previousMask, inpaintMethod, {
+      modelId: activeAiModelId,
+      tensorMode: activeAiTensorMode,
+    });
+    const quality = computeReconstructionQuality(activeItem.originalData, res.imageData, previousMask);
     const t1 = performance.now();
 
     const totalPixels = activeItem.width * activeItem.height;
@@ -453,7 +752,7 @@ export default function App() {
 
     setQueue((prev) =>
       prev.map((item) =>
-        item.id === activeItem.id
+        item.id === targetId
           ? {
               ...item,
               mask: previousMask,
@@ -461,26 +760,32 @@ export default function App() {
               redoStack: nextRedoStack,
               zones,
               coveragePercent,
-              cleanedData: cleaned,
-              cleanedUrl: imageDataToDataUrl(cleaned),
+              cleanedData: res.imageData,
+              cleanedUrl: imageDataToDataUrl(res.imageData),
               processingMs: Math.max(1, Math.round(t1 - t0)),
               quality,
+              usedAiModel: res.usedOfflineAiModel,
+              status: 'cleaned',
             }
           : item
       )
     );
-  }, [activeItem, inpaintMethod]);
+  }, [activeItem, inpaintMethod, activeAiModelId, activeAiTensorMode]);
 
   // Redo previously undone mask modification on the active item
-  const redoMask = useCallback(() => {
+  const redoMask = useCallback(async () => {
     if (!activeItem || activeItem.redoStack.length === 0) return;
+    const targetId = activeItem.id;
     const restoredMask = activeItem.redoStack[activeItem.redoStack.length - 1];
     const nextRedoStack = activeItem.redoStack.slice(0, -1);
     const nextUndoStack = [...activeItem.undoStack, new Uint8Array(activeItem.mask)];
 
     const t0 = performance.now();
-    const cleaned = removeWatermark(activeItem.originalData, restoredMask, inpaintMethod);
-    const quality = computeReconstructionQuality(activeItem.originalData, cleaned, restoredMask);
+    const res = await removeWatermarkAsync(activeItem.originalData, restoredMask, inpaintMethod, {
+      modelId: activeAiModelId,
+      tensorMode: activeAiTensorMode,
+    });
+    const quality = computeReconstructionQuality(activeItem.originalData, res.imageData, restoredMask);
     const t1 = performance.now();
 
     const totalPixels = activeItem.width * activeItem.height;
@@ -493,7 +798,7 @@ export default function App() {
 
     setQueue((prev) =>
       prev.map((item) =>
-        item.id === activeItem.id
+        item.id === targetId
           ? {
               ...item,
               mask: restoredMask,
@@ -501,15 +806,17 @@ export default function App() {
               redoStack: nextRedoStack,
               zones,
               coveragePercent,
-              cleanedData: cleaned,
-              cleanedUrl: imageDataToDataUrl(cleaned),
+              cleanedData: res.imageData,
+              cleanedUrl: imageDataToDataUrl(res.imageData),
               processingMs: Math.max(1, Math.round(t1 - t0)),
               quality,
+              usedAiModel: res.usedOfflineAiModel,
+              status: 'cleaned',
             }
           : item
       )
     );
-  }, [activeItem, inpaintMethod]);
+  }, [activeItem, inpaintMethod, activeAiModelId, activeAiTensorMode]);
 
   // Prompt confirmation dialog before resetting the active mask
   const handleResetMaskClick = useCallback(() => {
@@ -578,8 +885,11 @@ export default function App() {
       const nextRedoStack = [...item.redoStack, new Uint8Array(item.mask)];
 
       const t0 = performance.now();
-      const cleaned = removeWatermark(item.originalData, previousMask, inpaintMethod);
-      const quality = computeReconstructionQuality(item.originalData, cleaned, previousMask);
+      const res = await removeWatermarkAsync(item.originalData, previousMask, inpaintMethod, {
+        modelId: activeAiModelId,
+        tensorMode: activeAiTensorMode,
+      });
+      const quality = computeReconstructionQuality(item.originalData, res.imageData, previousMask);
       const t1 = performance.now();
 
       const totalPixels = item.width * item.height;
@@ -597,11 +907,12 @@ export default function App() {
         redoStack: nextRedoStack,
         zones,
         coveragePercent,
-        cleanedData: cleaned,
-        cleanedUrl: imageDataToDataUrl(cleaned),
+        cleanedData: res.imageData,
+        cleanedUrl: imageDataToDataUrl(res.imageData),
         processingMs: Math.max(1, Math.round(t1 - t0)),
         status: 'cleaned',
         quality,
+        usedAiModel: res.usedOfflineAiModel,
       });
     }
 
@@ -625,7 +936,7 @@ export default function App() {
         setIsBatchProcessing(false);
       }, 1200);
     }
-  }, [activeTargetQueue, isBatchProcessing, isZipping, inpaintMethod]);
+  }, [activeTargetQueue, isBatchProcessing, isZipping, inpaintMethod, activeAiModelId, activeAiTensorMode]);
 
   // Number of target queued items that have active masks, detected zones, or undo/redo stacks that can be reset
   const batchResettableCount = useMemo(() => {
@@ -694,7 +1005,7 @@ export default function App() {
             return;
           }
           const img = new Image();
-          img.onload = () => {
+          img.onload = async () => {
             const maxDim = 1600;
             let w = img.width;
             let h = img.height;
@@ -718,9 +1029,10 @@ export default function App() {
             let cleanedUrl = resizedOrigUrl;
             let processingMs = 0;
             let quality = computeReconstructionQuality(origData, cleanedData, mask);
+            let usedAiModel: OfflineAiModelId | null = null;
 
             if (autoCleanOnUpload || isSimpleMode) {
-              const res = runAutomaticPipeline(origData);
+              const res = await runAutomaticPipeline(origData);
               mask = res.mask;
               zones = res.zones;
               coveragePercent = res.coveragePercent;
@@ -728,6 +1040,7 @@ export default function App() {
               cleanedUrl = res.cleanedUrl;
               processingMs = res.processingMs;
               quality = res.quality;
+              usedAiModel = res.usedAiModel;
             }
 
             resolve({
@@ -747,6 +1060,7 @@ export default function App() {
               cleanedUrl,
               status: 'cleaned',
               quality,
+              usedAiModel,
             });
           };
           img.onerror = () => resolve(null);
@@ -765,6 +1079,9 @@ export default function App() {
       if (!files || files.length === 0) return;
       const fileList = Array.from(files).filter((f) => f.type.startsWith('image/'));
       if (fileList.length === 0) return;
+
+      // Prompt cleanly to download Offline Neural AI if weights are not cached yet
+      maybePromptForOfflineAi();
 
       const isBatch = fileList.length > 1;
       if (isBatch) {
@@ -825,7 +1142,7 @@ export default function App() {
         }, 1400);
       }
     },
-    [processImageFile]
+    [processImageFile, maybePromptForOfflineAi]
   );
 
   // Paste image directly from clipboard (WatermarkRemover.io Ctrl+V workflow)
@@ -893,6 +1210,12 @@ export default function App() {
         return;
       }
       if (e.key === 'Escape') {
+        if (showAiDownloadModal && !aiDownloadProgress) {
+          hasDismissedAiPromptRef.current = true;
+          setShowAiDownloadModal(false);
+          setHasPendingAiPrompt(false);
+          return;
+        }
         if (showShortcutsModal) {
           setShowShortcutsModal(false);
           return;
@@ -956,7 +1279,18 @@ export default function App() {
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('paste', handlePasteEvent);
     };
-  }, [undoMask, redoMask, handleFilesSelected, showResetConfirmModal, showBatchResetConfirmModal, showShortcutsModal, showBulkCropModal, showBatchRenameModal]);
+  }, [
+    undoMask,
+    redoMask,
+    handleFilesSelected,
+    showResetConfirmModal,
+    showBatchResetConfirmModal,
+    showShortcutsModal,
+    showBulkCropModal,
+    showBatchRenameModal,
+    showAiDownloadModal,
+    aiDownloadProgress,
+  ]);
 
   // Render the active image, split comparison, mask overlay, and detection zones onto the main canvas
   useEffect(() => {
@@ -1084,7 +1418,13 @@ export default function App() {
     };
   };
 
-  const paintBrushStroke = (cx: number, cy: number, isAdd: boolean, recordHistory: boolean) => {
+  const paintBrushStroke = (
+    cx: number,
+    cy: number,
+    isAdd: boolean,
+    recordHistory: boolean,
+    fastPreview: boolean = true
+  ) => {
     if (!activeItem) return;
     const { width, height, mask } = activeItem;
     const r = Math.max(2, Math.round(brushSize));
@@ -1102,7 +1442,7 @@ export default function App() {
         }
       }
     }
-    applyCustomMaskToActiveItem(nextMask, { recordHistory });
+    applyCustomMaskToActiveItem(nextMask, { recordHistory, fastPreview });
   };
 
   const handleCanvasPointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
@@ -1115,7 +1455,7 @@ export default function App() {
       setViewMode('compare');
       setComparePosition(Math.max(0, Math.min(100, (x / activeItem.width) * 100)));
     } else if (activeTool === 'brush-add' || activeTool === 'brush-erase') {
-      paintBrushStroke(x, y, activeTool === 'brush-add', true);
+      paintBrushStroke(x, y, activeTool === 'brush-add', true, true);
     } else if (activeTool === 'rect-add') {
       rectStartRef.current = { x, y };
       setDragRect({ x0: x, y0: y, x1: x, y1: y });
@@ -1132,7 +1472,7 @@ export default function App() {
     if (activeTool === 'compare') {
       setComparePosition(Math.max(0, Math.min(100, (x / activeItem.width) * 100)));
     } else if (activeTool === 'brush-add' || activeTool === 'brush-erase') {
-      paintBrushStroke(x, y, activeTool === 'brush-add', false);
+      paintBrushStroke(x, y, activeTool === 'brush-add', false, true);
     } else if (activeTool === 'rect-add' && rectStartRef.current) {
       setDragRect({
         x0: rectStartRef.current.x,
@@ -1146,6 +1486,14 @@ export default function App() {
   const handleCanvasPointerUp = () => {
     if (!isPointerDownRef.current) return;
     isPointerDownRef.current = false;
+
+    if ((activeTool === 'brush-add' || activeTool === 'brush-erase') && activeItem) {
+      // Refine completed brush stroke with Offline ONNX AI model if active
+      if (activeAiModelId && inpaintMethod === 'neural-ai') {
+        applyCustomMaskToActiveItem(activeItem.mask, { recordHistory: false, fastPreview: false });
+      }
+      return;
+    }
 
     if (activeTool === 'rect-add' && dragRect && activeItem) {
       const x0 = Math.max(0, Math.floor(Math.min(dragRect.x0, dragRect.x1)));
@@ -1260,7 +1608,7 @@ export default function App() {
       // Yield thread briefly for smooth UI update and animation
       await new Promise((r) => setTimeout(r, 25));
 
-      const res = runAutomaticPipeline(item.originalData);
+      const res = await runAutomaticPipeline(item.originalData);
 
       setQueue((prev) =>
         prev.map((q) =>
@@ -1277,6 +1625,7 @@ export default function App() {
                 processingMs: res.processingMs,
                 status: 'cleaned',
                 quality: res.quality,
+                usedAiModel: res.usedAiModel,
               }
             : q
         )
@@ -1527,8 +1876,10 @@ export default function App() {
         let processingMs: number;
         let quality: ReconstructionQuality;
 
+        let usedAiModel: OfflineAiModelId | null = item.usedAiModel ?? null;
+
         if (recleanAfterCrop) {
-          const res = runAutomaticPipeline(croppedOrig);
+          const res = await runAutomaticPipeline(croppedOrig);
           cleanedData = res.cleanedData;
           mask = res.mask;
           zones = res.zones;
@@ -1536,6 +1887,7 @@ export default function App() {
           processingMs = res.processingMs;
           cleanedUrl = res.cleanedUrl;
           quality = res.quality;
+          usedAiModel = res.usedAiModel;
         } else {
           cleanedData = cropImageData(item.cleanedData, rect);
           cleanedUrl = imageDataToDataUrl(cleanedData);
@@ -1544,6 +1896,7 @@ export default function App() {
           coveragePercent = 0;
           processingMs = item.processingMs;
           quality = computeReconstructionQuality(croppedOrig, cleanedData, mask);
+          usedAiModel = null;
         }
 
         const originalUrl = imageDataToDataUrl(croppedOrig);
@@ -1564,6 +1917,7 @@ export default function App() {
           cleanedUrl,
           status: 'cleaned',
           quality,
+          usedAiModel,
         };
 
         updatedQueueMap.set(item.id, updatedItem);
@@ -1784,12 +2138,37 @@ export default function App() {
         </div>
 
         <div className="flex items-center gap-4">
-          <div className="flex items-center gap-1.5 text-slate-600 dark:text-slate-400">
+          <button
+            type="button"
+            onClick={() => {
+              setHasPendingAiPrompt(false);
+              setShowAiDownloadModal(true);
+            }}
+            className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md border text-[11px] font-semibold transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
+              activeAiModelId
+                ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-700 dark:text-emerald-300 hover:bg-emerald-500/20'
+                : 'bg-amber-500/10 border-amber-500/30 text-amber-700 dark:text-amber-300 hover:bg-amber-500/20'
+            }`}
+            title="Configure or download Offline ONNX Neural AI model weights"
+          >
+            <Cpu className="w-3.5 h-3.5" />
+            <span>
+              {aiDownloadProgress
+                ? `Downloading AI ${aiDownloadProgress.percent}%`
+                : activeAiModelId
+                ? `Offline AI: ${OFFLINE_AI_MODELS[activeAiModelId].shortName}${
+                    activeAiBackend ? ` (${activeAiBackend})` : ''
+                  }`
+                : 'Download Offline AI (28 MB)'}
+            </span>
+          </button>
+
+          <div className="hidden xl:flex items-center gap-1.5 text-slate-600 dark:text-slate-400">
             <ShieldCheck className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" />
             <span>
               {isOnline
-                ? '100% Local Processing · Offline Cache Ready'
-                : 'Offline Mode Active · Running From Local Cache'}
+                ? '100% Local Processing'
+                : 'Offline Mode Active'}
             </span>
           </div>
 
@@ -1839,16 +2218,32 @@ export default function App() {
             setRemoveLogo(next);
             rerunActiveItemAuto({ remLogo: next });
           }}
-          onReRunAutoClean={() => rerunActiveItemAuto()}
+          onReRunAutoClean={() => {
+            if (!activeAiModelId && !hasDismissedAiPromptRef.current) {
+              maybePromptForOfflineAi();
+            }
+            rerunActiveItemAuto();
+          }}
           inpaintMethod={inpaintMethod}
           onInpaintMethodChange={(m) => {
             setInpaintMethod(m);
+            if (m === 'neural-ai' && !activeAiModelId) {
+              setHasPendingAiPrompt(false);
+              setShowAiDownloadModal(true);
+            }
             if (activeItem) {
               applyCustomMaskToActiveItem(activeItem.mask, {
                 methodOverride: m,
                 recordHistory: false,
               });
             }
+          }}
+          activeAiModelId={activeAiModelId}
+          activeAiBackend={activeAiBackend}
+          aiDownloadProgress={aiDownloadProgress}
+          onOpenAiManager={() => {
+            setHasPendingAiPrompt(false);
+            setShowAiDownloadModal(true);
           }}
           onSuggestAutoCrop={handleSuggestAutoCrop}
           autoCropSummaryBadge={autoCropSuggestion?.summaryBadge || null}
@@ -1857,7 +2252,7 @@ export default function App() {
           isExportingIndividually={isExportingIndividually}
           batchProgress={batchProgress}
           samples={OFFLINE_SAMPLES}
-          onLoadSample={loadSamplePreset}
+          onLoadSample={(s) => loadSamplePreset(s, true)}
           onSwitchToProMode={() => setIsSimpleMode(false)}
           smartOptimize={smartOptimize}
           onToggleSmartOptimize={() => setSmartOptimize((prev) => !prev)}
@@ -2127,13 +2522,30 @@ export default function App() {
 
             {/* Section 4: Reconstruction Algorithm */}
             <div className="space-y-2 pt-4 border-t border-slate-200 dark:border-slate-800">
-              <h2 className="text-xs font-semibold text-slate-900 dark:text-slate-100">
-                04. Offline AI Reconstruction Solver
-              </h2>
+              <div className="flex items-center justify-between gap-2">
+                <h2 className="text-xs font-semibold text-slate-900 dark:text-slate-100">
+                  04. Offline AI Reconstruction Solver
+                </h2>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setHasPendingAiPrompt(false);
+                    setShowAiDownloadModal(true);
+                  }}
+                  className="text-[11px] font-semibold text-blue-600 dark:text-sky-400 hover:underline cursor-pointer shrink-0"
+                >
+                  {activeAiModelId ? 'Manage AI Weights' : 'Download AI Model'}
+                </button>
+              </div>
               <div className="grid grid-cols-2 gap-1 p-1 bg-slate-100 dark:bg-slate-800 rounded-lg">
                 {(
                   [
-                    { id: 'neural-ai', label: 'Neural AI Multi-Scale' },
+                    {
+                      id: 'neural-ai',
+                      label: activeAiModelId
+                        ? `Neural ONNX (${OFFLINE_AI_MODELS[activeAiModelId].shortName})`
+                        : 'Neural AI Multi-Scale',
+                    },
                     { id: 'hybrid-smart', label: 'Hybrid Alpha+Telea' },
                     { id: 'patch-synthesis', label: 'Patch Synthesis' },
                     { id: 'telea-inpaint', label: 'Fast Marching' },
@@ -2144,6 +2556,10 @@ export default function App() {
                     key={m.id}
                     onClick={() => {
                       setInpaintMethod(m.id);
+                      if (m.id === 'neural-ai' && !activeAiModelId) {
+                        setHasPendingAiPrompt(false);
+                        setShowAiDownloadModal(true);
+                      }
                       if (activeItem) {
                         applyCustomMaskToActiveItem(activeItem.mask, {
                           methodOverride: m.id,
@@ -3518,6 +3934,28 @@ export default function App() {
       <KeyboardShortcutsModal
         isOpen={showShortcutsModal}
         onClose={() => setShowShortcutsModal(false)}
+      />
+
+      {/* Offline Neural AI Model Download & Cache Prompt Modal */}
+      <OfflineAiDownloadModal
+        isOpen={showAiDownloadModal}
+        onClose={() => {
+          if (aiDownloadProgress) return;
+          hasDismissedAiPromptRef.current = true;
+          setShowAiDownloadModal(false);
+          setHasPendingAiPrompt(false);
+        }}
+        selectedModelId={activeAiModelId || 'migan-v2'}
+        cachedModels={cachedAiModels}
+        activeBackend={activeAiBackend}
+        downloadProgress={aiDownloadProgress}
+        downloadError={aiDownloadError}
+        hasPendingAutoCleanPrompt={hasPendingAiPrompt}
+        onSelectAndActivateModel={handleSelectAndActivateAiModel}
+        onStartDownloadModel={handleStartDownloadAiModel}
+        onCancelDownload={handleCancelAiDownload}
+        onDeleteCachedModel={handleDeleteCachedAiModel}
+        onImportLocalFile={handleImportLocalOnnxModel}
       />
     </div>
   );
