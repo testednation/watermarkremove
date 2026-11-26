@@ -143,6 +143,7 @@ export const SimpleModeWorkspace: React.FC<SimpleModeWorkspaceProps> = ({
   savingsPercent,
 }) => {
   const [previewMode, setPreviewMode] = useState<'side-by-side' | 'split' | 'clean'>('side-by-side');
+  const [isBeforeAfterStatic, setIsBeforeAfterStatic] = useState<boolean>(false);
   const [splitPos, setSplitPos] = useState<number>(50);
   const [isHoldingOriginal, setIsHoldingOriginal] = useState<boolean>(false);
   const [isPointerDraggingSplit, setIsPointerDraggingSplit] = useState<boolean>(false);
@@ -516,9 +517,31 @@ export const SimpleModeWorkspace: React.FC<SimpleModeWorkspaceProps> = ({
               <div className="flex items-center gap-1.5 flex-wrap">
                 <button
                   type="button"
-                  onClick={() => setPreviewMode('side-by-side')}
+                  aria-pressed={isBeforeAfterStatic}
+                  onClick={() => {
+                    setIsBeforeAfterStatic((prev) => !prev);
+                    setHoverLensPos(null);
+                    setIsHoldingOriginal(false);
+                    setIsPointerDraggingSplit(false);
+                  }}
+                  className={`px-3 py-1.5 rounded-xl text-xs font-bold flex items-center gap-1.5 transition-colors cursor-pointer border ${
+                    isBeforeAfterStatic
+                      ? 'bg-emerald-600 text-white border-emerald-500 shadow-xs'
+                      : 'bg-slate-200/70 dark:bg-slate-800 border-transparent text-slate-700 dark:text-slate-300 hover:bg-slate-300/70'
+                  }`}
+                  title="Display Original and Cleaned Result side-by-side in a static, non-interactive view for quick review"
+                >
+                  <Columns2 className="w-3.5 h-3.5" />
+                  <span>Before/After</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setIsBeforeAfterStatic(false);
+                    setPreviewMode('side-by-side');
+                  }}
                   className={`px-3 py-1.5 rounded-xl text-xs font-bold flex items-center gap-1.5 transition-colors cursor-pointer ${
-                    previewMode === 'side-by-side' && !isHoldingOriginal
+                    !isBeforeAfterStatic && previewMode === 'side-by-side' && !isHoldingOriginal
                       ? 'bg-blue-600 text-white shadow-xs'
                       : 'bg-slate-200/70 dark:bg-slate-800 text-slate-700 dark:text-slate-300 hover:bg-slate-300/70'
                   }`}
@@ -528,9 +551,12 @@ export const SimpleModeWorkspace: React.FC<SimpleModeWorkspaceProps> = ({
                 </button>
                 <button
                   type="button"
-                  onClick={() => setPreviewMode('split')}
+                  onClick={() => {
+                    setIsBeforeAfterStatic(false);
+                    setPreviewMode('split');
+                  }}
                   className={`px-3 py-1.5 rounded-xl text-xs font-bold flex items-center gap-1.5 transition-colors cursor-pointer ${
-                    previewMode === 'split' && !isHoldingOriginal
+                    !isBeforeAfterStatic && previewMode === 'split' && !isHoldingOriginal
                       ? 'bg-blue-600 text-white shadow-xs'
                       : 'bg-slate-200/70 dark:bg-slate-800 text-slate-700 dark:text-slate-300 hover:bg-slate-300/70'
                   }`}
@@ -540,9 +566,12 @@ export const SimpleModeWorkspace: React.FC<SimpleModeWorkspaceProps> = ({
                 </button>
                 <button
                   type="button"
-                  onClick={() => setPreviewMode('clean')}
+                  onClick={() => {
+                    setIsBeforeAfterStatic(false);
+                    setPreviewMode('clean');
+                  }}
                   className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-colors cursor-pointer ${
-                    previewMode === 'clean' && !isHoldingOriginal
+                    !isBeforeAfterStatic && previewMode === 'clean' && !isHoldingOriginal
                       ? 'bg-blue-600 text-white shadow-xs'
                       : 'bg-slate-200/70 dark:bg-slate-800 text-slate-700 dark:text-slate-300 hover:bg-slate-300/70'
                   }`}
@@ -550,7 +579,7 @@ export const SimpleModeWorkspace: React.FC<SimpleModeWorkspaceProps> = ({
                   Clean Result
                 </button>
 
-                {previewMode === 'side-by-side' && (
+                {!isBeforeAfterStatic && previewMode === 'side-by-side' && (
                   <button
                     type="button"
                     onClick={() => setEnableMagnifier((prev) => !prev)}
@@ -566,25 +595,61 @@ export const SimpleModeWorkspace: React.FC<SimpleModeWorkspaceProps> = ({
                   </button>
                 )}
 
-                <button
-                  type="button"
-                  onPointerDown={() => setIsHoldingOriginal(true)}
-                  onPointerUp={() => setIsHoldingOriginal(false)}
-                  onPointerLeave={() => setIsHoldingOriginal(false)}
-                  className={`px-3 py-1.5 rounded-xl text-xs font-bold flex items-center gap-1.5 transition-colors cursor-pointer select-none ${
-                    isHoldingOriginal
-                      ? 'bg-amber-500 text-slate-950'
-                      : 'bg-slate-200/70 dark:bg-slate-800 text-slate-700 dark:text-slate-300 hover:bg-slate-300/70'
-                  }`}
-                >
-                  <Eye className="w-3.5 h-3.5" />
-                  <span>Hold Original</span>
-                </button>
+                {!isBeforeAfterStatic && (
+                  <button
+                    type="button"
+                    onPointerDown={() => setIsHoldingOriginal(true)}
+                    onPointerUp={() => setIsHoldingOriginal(false)}
+                    onPointerLeave={() => setIsHoldingOriginal(false)}
+                    className={`px-3 py-1.5 rounded-xl text-xs font-bold flex items-center gap-1.5 transition-colors cursor-pointer select-none ${
+                      isHoldingOriginal
+                        ? 'bg-amber-500 text-slate-950'
+                        : 'bg-slate-200/70 dark:bg-slate-800 text-slate-700 dark:text-slate-300 hover:bg-slate-300/70'
+                    }`}
+                  >
+                    <Eye className="w-3.5 h-3.5" />
+                    <span>Hold Original</span>
+                  </button>
+                )}
               </div>
             </div>
 
             {/* Main Image Canvas / Comparison Box */}
-            {previewMode === 'side-by-side' && !isHoldingOriginal ? (
+            {isBeforeAfterStatic ? (
+              <div
+                aria-label="Static Before and After comparison view"
+                className="p-4 md:p-6 pointer-events-none select-none"
+              >
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 items-center">
+                  <div className="relative rounded-xl overflow-hidden border border-slate-300 dark:border-slate-800 bg-slate-900 shadow-md">
+                    <img
+                      src={activeItem.originalUrl}
+                      alt="Before: original watermarked"
+                      draggable={false}
+                      className="w-full h-auto max-h-[380px] object-contain mx-auto block pointer-events-none select-none"
+                    />
+                    <div className="absolute top-3 left-3 px-2.5 py-1 rounded-md bg-slate-950/85 text-xs font-bold text-slate-200 border border-slate-700/70">
+                      Before · Original
+                    </div>
+                  </div>
+                  <div className="relative rounded-xl overflow-hidden border border-emerald-500/40 dark:border-emerald-500/30 bg-slate-900 shadow-md">
+                    <img
+                      src={activeItem.cleanedUrl}
+                      alt="After: cleaned result"
+                      draggable={false}
+                      className="w-full h-auto max-h-[380px] object-contain mx-auto block pointer-events-none select-none"
+                    />
+                    <div className="absolute top-3 left-3 px-2.5 py-1 rounded-md bg-emerald-600/95 text-xs font-bold text-white shadow-xs flex items-center gap-1.5">
+                      <Check className="w-3.5 h-3.5" />
+                      <span>After · Cleaned Result</span>
+                    </div>
+                  </div>
+                </div>
+                <p className="mt-2.5 text-center text-[11px] text-slate-500 dark:text-slate-400">
+                  Static Before/After quick review (non-interactive). Click Before/After again to return to interactive views.
+                </p>
+              </div>
+            ) : previewMode === 'side-by-side' && !isHoldingOriginal ? (
               <div className="p-4 md:p-6">
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4 items-center">
                   {/* Left Panel: Original Watermarked Image */}

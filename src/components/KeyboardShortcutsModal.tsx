@@ -21,6 +21,8 @@ import {
   Command,
   Bookmark,
   RotateCcw,
+  Grid3x3,
+  Columns2,
 } from 'lucide-react';
 
 interface ShortcutItem {
@@ -71,6 +73,14 @@ const SHORTCUTS: ShortcutItem[] = [
     keys: ['Space', 'Hold'],
     icon: <Eye className="w-4 h-4 text-amber-500" />,
   },
+  {
+    id: 'toggle-grid-guides',
+    category: 'edit',
+    label: 'Toggle Grid & Alignment Guides',
+    description: 'Show or hide alignment guides, rule-of-thirds, diagonal lattice, and live pixel crosshair on canvas.',
+    keys: ['G'],
+    icon: <Grid3x3 className="w-4 h-4 text-sky-500" />,
+  },
 
   // Clipboard & Import
   {
@@ -91,6 +101,14 @@ const SHORTCUTS: ShortcutItem[] = [
   },
 
   // Views & Navigation
+  {
+    id: 'before-after-toggle',
+    category: 'views',
+    label: 'Toggle Before/After View',
+    description: 'Display Original and Cleaned Result side-by-side in a static, non-interactive review view.',
+    keys: ['B'],
+    icon: <Columns2 className="w-4 h-4 text-blue-500" />,
+  },
   {
     id: 'mode-switch',
     category: 'views',

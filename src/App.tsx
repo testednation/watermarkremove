@@ -36,6 +36,7 @@ import {
   HelpCircle,
   FileDown,
   Cpu,
+  Grid3x3,
 } from 'lucide-react';
 import JSZip from 'jszip';
 import {
@@ -164,11 +165,17 @@ export default function App() {
 
   // Canvas & interactive tool state
   const [viewMode, setViewMode] = useState<ViewMode>('compare');
+  const [showBeforeAfterView, setShowBeforeAfterView] = useState<boolean>(false);
   const [activeTool, setActiveTool] = useState<ActiveTool>('compare');
   const [brushSize, setBrushSize] = useState<number>(24);
   const [comparePosition, setComparePosition] = useState<number>(52);
   const [showZoneBoxes, setShowZoneBoxes] = useState<boolean>(true);
   const [showEdgeNoiseOverlay, setShowEdgeNoiseOverlay] = useState<boolean>(false);
+  const [showAlignmentGuides, setShowAlignmentGuides] = useState<boolean>(false);
+  const [alignmentGuideStyle, setAlignmentGuideStyle] = useState<
+    'thirds-center' | 'fine-grid' | 'diagonal-proof'
+  >('thirds-center');
+  const [canvasHoverCoords, setCanvasHoverCoords] = useState<{ x: number; y: number } | null>(null);
   const [showResetConfirmModal, setShowResetConfirmModal] = useState<boolean>(false);
   const [showBatchResetConfirmModal, setShowBatchResetConfirmModal] = useState<boolean>(false);
   const [showBulkCropModal, setShowBulkCropModal] = useState<boolean>(false);
@@ -1242,6 +1249,16 @@ export default function App() {
         setShowShortcutsModal((prev) => !prev);
         return;
       }
+      if (!e.metaKey && !e.ctrlKey && !e.altKey && e.key.toLowerCase() === 'g') {
+        e.preventDefault();
+        setShowAlignmentGuides((prev) => !prev);
+        return;
+      }
+      if (!e.metaKey && !e.ctrlKey && !e.altKey && e.key.toLowerCase() === 'b') {
+        e.preventDefault();
+        setShowBeforeAfterView((prev) => !prev);
+        return;
+      }
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'z') {
         e.preventDefault();
         if (e.shiftKey) {
@@ -1294,7 +1311,7 @@ export default function App() {
 
   // Render the active image, split comparison, mask overlay, and detection zones onto the main canvas
   useEffect(() => {
-    if (viewMode === 'side-by-side') return;
+    if (viewMode === 'side-by-side' || showBeforeAfterView) return;
     const canvas = displayCanvasRef.current;
     if (!canvas || !activeItem) return;
     canvas.width = activeItem.width;
@@ -1404,7 +1421,149 @@ export default function App() {
       ctx.strokeRect(rx, ry, rw, rh);
       ctx.restore();
     }
-  }, [activeItem, viewMode, comparePosition, showZoneBoxes, showEdgeNoiseOverlay, autoCropSuggestion, dragRect, isHoldingOriginal, isSimpleMode]);
+
+    if (showAlignmentGuides) {
+      ctx.save();
+      const w = activeItem.width;
+      const h = activeItem.height;
+      const scaleUnit = Math.max(1, Math.round(Math.min(w, h) / 650));
+
+      const drawDualLine = (
+        x1: number,
+        y1: number,
+        x2: number,
+        y2: number,
+        fgColor: string,
+        lineWidth: number,
+        dash: number[] = []
+      ) => {
+        ctx.setLineDash(dash);
+        ctx.strokeStyle = 'rgba(15, 23, 42, 0.55)';
+        ctx.lineWidth = lineWidth + scaleUnit;
+        ctx.beginPath();
+        ctx.moveTo(x1, y1);
+        ctx.lineTo(x2, y2);
+        ctx.stroke();
+
+        ctx.strokeStyle = fgColor;
+        ctx.lineWidth = lineWidth;
+        ctx.beginPath();
+        ctx.moveTo(x1, y1);
+        ctx.lineTo(x2, y2);
+        ctx.stroke();
+      };
+
+      if (alignmentGuideStyle === 'thirds-center') {
+        // Rule of thirds lines
+        [1 / 3, 2 / 3].forEach((frac) => {
+          const vx = Math.round(w * frac) + 0.5;
+          const hy = Math.round(h * frac) + 0.5;
+          drawDualLine(vx, 0, vx, h, 'rgba(56, 189, 248, 0.85)', scaleUnit, [6 * scaleUnit, 4 * scaleUnit]);
+          drawDualLine(0, hy, w, hy, 'rgba(56, 189, 248, 0.85)', scaleUnit, [6 * scaleUnit, 4 * scaleUnit]);
+        });
+
+        // Exact center axes
+        const cx = Math.round(w / 2) + 0.5;
+        const cy = Math.round(h / 2) + 0.5;
+        drawDualLine(cx, 0, cx, h, 'rgba(250, 204, 21, 0.9)', scaleUnit, []);
+        drawDualLine(0, cy, w, cy, 'rgba(250, 204, 21, 0.9)', scaleUnit, []);
+
+        // Corner-watermark safety frame (10% outer margin box)
+        const mx = Math.round(w * 0.1);
+        const my = Math.round(h * 0.1);
+        ctx.setLineDash([4 * scaleUnit, 4 * scaleUnit]);
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.45)';
+        ctx.lineWidth = scaleUnit;
+        ctx.strokeRect(mx + 0.5, my + 0.5, w - mx * 2, h - my * 2);
+      } else if (alignmentGuideStyle === 'fine-grid') {
+        const cellSize = Math.max(24, Math.round(Math.min(w, h) / 14));
+        for (let gx = cellSize; gx < w; gx += cellSize) {
+          const px = gx + 0.5;
+          drawDualLine(px, 0, px, h, 'rgba(56, 189, 248, 0.55)', scaleUnit, []);
+        }
+        for (let gy = cellSize; gy < h; gy += cellSize) {
+          const py = gy + 0.5;
+          drawDualLine(0, py, w, py, 'rgba(56, 189, 248, 0.55)', scaleUnit, []);
+        }
+        // Highlighted center crosshairs
+        const cx = Math.round(w / 2) + 0.5;
+        const cy = Math.round(h / 2) + 0.5;
+        drawDualLine(cx, 0, cx, h, 'rgba(250, 204, 21, 0.92)', scaleUnit * 1.4, []);
+        drawDualLine(0, cy, w, cy, 'rgba(250, 204, 21, 0.92)', scaleUnit * 1.4, []);
+      } else if (alignmentGuideStyle === 'diagonal-proof') {
+        // Diagonal +45 / -45 degree guide lines for checking tiled watermark angle & spacing
+        const diagStep = Math.max(48, Math.round(Math.min(w, h) / 6));
+        for (let offset = -h; offset < w + h; offset += diagStep) {
+          drawDualLine(
+            offset,
+            0,
+            offset + h,
+            h,
+            'rgba(192, 132, 252, 0.78)',
+            scaleUnit,
+            [5 * scaleUnit, 4 * scaleUnit]
+          );
+          drawDualLine(
+            offset,
+            h,
+            offset + h,
+            0,
+            'rgba(56, 189, 248, 0.72)',
+            scaleUnit,
+            [5 * scaleUnit, 4 * scaleUnit]
+          );
+        }
+        const cx = Math.round(w / 2) + 0.5;
+        const cy = Math.round(h / 2) + 0.5;
+        drawDualLine(cx, 0, cx, h, 'rgba(250, 204, 21, 0.85)', scaleUnit, []);
+        drawDualLine(0, cy, w, cy, 'rgba(250, 204, 21, 0.85)', scaleUnit, []);
+      }
+
+      // Live pointer alignment crosshair & pixel coordinate readout
+      if (canvasHoverCoords) {
+        const hx = Math.round(canvasHoverCoords.x) + 0.5;
+        const hy = Math.round(canvasHoverCoords.y) + 0.5;
+        drawDualLine(hx, 0, hx, h, 'rgba(52, 211, 153, 0.88)', scaleUnit, [3 * scaleUnit, 3 * scaleUnit]);
+        drawDualLine(0, hy, w, hy, 'rgba(52, 211, 153, 0.88)', scaleUnit, [3 * scaleUnit, 3 * scaleUnit]);
+
+        const labelText = `x:${Math.round(canvasHoverCoords.x)} y:${Math.round(canvasHoverCoords.y)}`;
+        const fontSize = Math.max(11, Math.round(Math.min(w, h) * 0.02));
+        ctx.font = `600 ${fontSize}px ui-monospace, SFMono-Regular, Menlo, monospace`;
+        const metrics = ctx.measureText(labelText);
+        const padX = Math.round(fontSize * 0.5);
+        const boxW = metrics.width + padX * 2;
+        const boxH = Math.round(fontSize * 1.55);
+        const bx = hx + 12 + boxW > w ? Math.max(4, hx - boxW - 10) : hx + 10;
+        const by = hy - boxH - 10 < 4 ? Math.min(h - boxH - 4, hy + 10) : hy - boxH - 10;
+
+        ctx.setLineDash([]);
+        ctx.fillStyle = 'rgba(15, 23, 42, 0.88)';
+        ctx.fillRect(bx, by, boxW, boxH);
+        ctx.strokeStyle = 'rgba(52, 211, 153, 0.8)';
+        ctx.lineWidth = Math.max(1, scaleUnit);
+        ctx.strokeRect(bx, by, boxW, boxH);
+        ctx.fillStyle = '#6ee7b7';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(labelText, bx + padX, by + boxH / 2);
+      }
+
+      ctx.restore();
+    }
+  }, [
+    activeItem,
+    viewMode,
+    comparePosition,
+    showZoneBoxes,
+    showEdgeNoiseOverlay,
+    showAlignmentGuides,
+    alignmentGuideStyle,
+    canvasHoverCoords,
+    autoCropSuggestion,
+    dragRect,
+    isHoldingOriginal,
+    isSimpleMode,
+    showBeforeAfterView,
+  ]);
 
   const getCanvasCoords = (e: React.PointerEvent<HTMLCanvasElement>) => {
     const canvas = displayCanvasRef.current;
@@ -1466,8 +1625,12 @@ export default function App() {
   };
 
   const handleCanvasPointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    if (!isPointerDownRef.current || !activeItem) return;
+    if (!activeItem) return;
     const { x, y } = getCanvasCoords(e);
+    if (showAlignmentGuides) {
+      setCanvasHoverCoords({ x, y });
+    }
+    if (!isPointerDownRef.current) return;
 
     if (activeTool === 'compare') {
       setComparePosition(Math.max(0, Math.min(100, (x / activeItem.width) * 100)));
@@ -2612,13 +2775,14 @@ export default function App() {
                   <button
                     key={tool.id}
                     onClick={() => {
+                      setShowBeforeAfterView(false);
                       setActiveTool(tool.id);
                       if (tool.id === 'compare' && viewMode === 'side-by-side') {
                         setViewMode('compare');
                       }
                     }}
                     className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                      isActive
+                      isActive && !showBeforeAfterView
                         ? 'bg-white dark:bg-slate-900 text-blue-600 dark:text-blue-400 shadow-xs'
                         : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
                     }`}
@@ -2630,52 +2794,81 @@ export default function App() {
               })}
             </div>
 
-            {/* Right: View Mode Switcher (including WatermarkRemover.io Side-by-Side & Edge Noise Visualization modes) */}
-            <div className="flex items-center gap-1 p-1 bg-slate-100 dark:bg-slate-800 rounded-lg">
-              {(
-                [
-                  { id: 'compare', label: 'Split Slider' },
-                  { id: 'side-by-side', label: 'Side-by-Side' },
-                  { id: 'clean', label: 'Clean Result' },
-                  { id: 'mask', label: 'Mask Map' },
-                  { id: 'edge-noise', label: 'Edge Noise' },
-                ] as const
-              ).map((v) => (
-                <button
-                  key={v.id}
-                  onClick={() => setViewMode(v.id)}
-                  className={`px-2.5 py-1.5 rounded-md text-xs font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer flex items-center gap-1.5 ${
-                    viewMode === v.id
-                      ? v.id === 'edge-noise'
-                        ? 'bg-red-600 text-white shadow-xs'
-                        : 'bg-white dark:bg-slate-900 text-slate-900 dark:text-white shadow-xs'
-                      : v.id === 'edge-noise'
-                      ? 'text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/40'
-                      : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
-                  }`}
-                  title={
-                    v.id === 'edge-noise'
-                      ? 'Highlight detected edge noise, border artifacts, and targeted non-content margins in red on the main canvas'
-                      : undefined
-                  }
-                >
-                  {v.id === 'edge-noise' && (
-                    <span
-                      className={`w-2 h-2 rounded-full ${
-                        viewMode === 'edge-noise' ? 'bg-white animate-pulse' : 'bg-red-500'
-                      }`}
-                    />
-                  )}
-                  {v.label}
-                </button>
-              ))}
+            {/* Right: Before/After Quick Review Toggle + View Mode Switcher */}
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                aria-pressed={showBeforeAfterView}
+                onClick={() => setShowBeforeAfterView((prev) => !prev)}
+                className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors whitespace-nowrap shrink-0 cursor-pointer flex items-center gap-1.5 border ${
+                  showBeforeAfterView
+                    ? 'bg-blue-600 text-white border-blue-500 shadow-xs'
+                    : 'bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-200 border-slate-200 dark:border-slate-700 hover:border-blue-500'
+                }`}
+                title="Toggle static, non-interactive Before/After side-by-side comparison view for quick review (Shortcut: B)"
+              >
+                <Columns2 className="w-3.5 h-3.5" />
+                <span>Before/After</span>
+              </button>
+
+              <div className="flex items-center gap-1 p-1 bg-slate-100 dark:bg-slate-800 rounded-lg">
+                {(
+                  [
+                    { id: 'compare', label: 'Split Slider' },
+                    { id: 'side-by-side', label: 'Side-by-Side' },
+                    { id: 'clean', label: 'Clean Result' },
+                    { id: 'mask', label: 'Mask Map' },
+                    { id: 'edge-noise', label: 'Edge Noise' },
+                  ] as const
+                ).map((v) => (
+                  <button
+                    key={v.id}
+                    onClick={() => {
+                      setShowBeforeAfterView(false);
+                      setViewMode(v.id);
+                    }}
+                    className={`px-2.5 py-1.5 rounded-md text-xs font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer flex items-center gap-1.5 ${
+                      !showBeforeAfterView && viewMode === v.id
+                        ? v.id === 'edge-noise'
+                          ? 'bg-red-600 text-white shadow-xs'
+                          : 'bg-white dark:bg-slate-900 text-slate-900 dark:text-white shadow-xs'
+                        : v.id === 'edge-noise'
+                        ? 'text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/40'
+                        : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+                    }`}
+                    title={
+                      v.id === 'edge-noise'
+                        ? 'Highlight detected edge noise, border artifacts, and targeted non-content margins in red on the main canvas'
+                        : undefined
+                    }
+                  >
+                    {v.id === 'edge-noise' && (
+                      <span
+                        className={`w-2 h-2 rounded-full ${
+                          !showBeforeAfterView && viewMode === 'edge-noise'
+                            ? 'bg-white animate-pulse'
+                            : 'bg-red-500'
+                        }`}
+                      />
+                    )}
+                    {v.label}
+                  </button>
+                ))}
+              </div>
             </div>
           </div>
 
           {/* Contextual Brush Size / Undo-Redo / Hold-to-Compare Bar */}
           <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-1.5 bg-slate-50/90 dark:bg-slate-900/50 border-b border-slate-200/80 dark:border-slate-800/80 text-xs text-slate-600 dark:text-slate-400">
             <div>
-              {viewMode === 'edge-noise' ? (
+              {showBeforeAfterView ? (
+                <span className="flex items-center gap-1.5 text-blue-600 dark:text-sky-300 font-medium">
+                  <Columns2 className="w-3.5 h-3.5" />
+                  <span>
+                    Static Before/After Quick Review (non-interactive): Original (Left) vs Cleaned Result (Right). Click Before/After or press B to resume editing.
+                  </span>
+                </span>
+              ) : viewMode === 'edge-noise' ? (
                 <span className="flex flex-wrap items-center gap-2 text-red-700 dark:text-red-300 font-medium">
                   <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-red-100 dark:bg-red-950/80 border border-red-300 dark:border-red-800 text-[11px] font-semibold text-red-700 dark:text-red-300">
                     <span className="w-2 h-2 rounded-full bg-red-600" />
@@ -2732,7 +2925,7 @@ export default function App() {
             </div>
 
             <div className="flex items-center gap-3">
-              {viewMode !== 'side-by-side' && (
+              {viewMode !== 'side-by-side' && !showBeforeAfterView && (
                 <button
                   onPointerDown={() => setIsHoldingOriginal(true)}
                   onPointerUp={() => setIsHoldingOriginal(false)}
@@ -2743,6 +2936,47 @@ export default function App() {
                   Hold for Original
                 </button>
               )}
+
+              <div className="flex items-center gap-1.5">
+                <label
+                  className={`flex items-center gap-1.5 px-2 py-1 rounded border text-[11px] font-medium cursor-pointer select-none whitespace-nowrap shrink-0 transition-colors ${
+                    showAlignmentGuides
+                      ? 'bg-sky-500/15 border-sky-500/50 text-sky-700 dark:text-sky-300'
+                      : 'border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-600 dark:text-slate-300 hover:border-sky-400'
+                  }`}
+                  title="Toggle alignment grid & crosshair guides to check watermark alignment during manual refinement (Shortcut: G)"
+                >
+                  <input
+                    type="checkbox"
+                    checked={showAlignmentGuides}
+                    onChange={(e) => {
+                      setShowAlignmentGuides(e.target.checked);
+                      if (!e.target.checked) setCanvasHoverCoords(null);
+                    }}
+                    className="sr-only"
+                  />
+                  <Grid3x3 className="w-3.5 h-3.5" />
+                  <span>Grid Guides</span>
+                </label>
+
+                {showAlignmentGuides && (
+                  <select
+                    aria-label="Alignment guide style"
+                    value={alignmentGuideStyle}
+                    onChange={(e) =>
+                      setAlignmentGuideStyle(
+                        e.target.value as 'thirds-center' | 'fine-grid' | 'diagonal-proof'
+                      )
+                    }
+                    className="px-2 py-1 rounded border border-sky-500/40 bg-white dark:bg-slate-800 text-[11px] font-medium text-slate-700 dark:text-slate-200 focus:outline-none cursor-pointer"
+                    title="Select alignment guide overlay pattern"
+                  >
+                    <option value="thirds-center">Thirds + Center</option>
+                    <option value="fine-grid">Fine Square Grid</option>
+                    <option value="diagonal-proof">Diagonal Lattice</option>
+                  </select>
+                )}
+              </div>
 
               <label
                 className="flex items-center gap-1.5 cursor-pointer select-none whitespace-nowrap shrink-0 text-red-600 dark:text-red-400 font-medium"
@@ -2837,7 +3071,46 @@ export default function App() {
           {/* Canvas Container */}
           <div className="flex-1 flex items-center justify-center p-6 overflow-hidden">
             {activeItem ? (
-              viewMode === 'side-by-side' ? (
+              showBeforeAfterView ? (
+                <div
+                  aria-label="Static Before and After comparison view"
+                  className="grid grid-cols-1 md:grid-cols-2 gap-4 w-full max-w-5xl items-center pointer-events-none select-none"
+                >
+                  <div className="relative rounded-xl overflow-hidden border border-slate-300 dark:border-slate-800 bg-slate-900 shadow-md">
+                    <img
+                      src={activeItem.originalUrl}
+                      alt="Before: original watermarked"
+                      referrerPolicy="no-referrer"
+                      draggable={false}
+                      className="w-full h-auto max-h-[62vh] object-contain mx-auto block pointer-events-none select-none"
+                    />
+                    <div className="absolute top-3 left-3 px-2.5 py-1 rounded bg-slate-950/85 border border-slate-700/70 text-[11px] font-semibold text-slate-200">
+                      Before · Original
+                    </div>
+                    <div className="absolute bottom-3 right-3 px-2 py-0.5 rounded bg-slate-950/80 text-[10px] font-mono text-slate-300">
+                      {activeItem.width}×{activeItem.height}
+                    </div>
+                  </div>
+                  <div className="relative rounded-xl overflow-hidden border border-emerald-500/40 dark:border-emerald-500/30 bg-slate-900 shadow-md">
+                    <img
+                      src={activeItem.cleanedUrl}
+                      alt="After: cleaned result"
+                      referrerPolicy="no-referrer"
+                      draggable={false}
+                      className="w-full h-auto max-h-[62vh] object-contain mx-auto block pointer-events-none select-none"
+                    />
+                    <div className="absolute top-3 left-3 px-2.5 py-1 rounded bg-emerald-600/95 text-[11px] font-semibold text-white shadow-xs flex items-center gap-1.5">
+                      <Check className="w-3.5 h-3.5" />
+                      <span>After · Cleaned Result</span>
+                    </div>
+                    {activeItem.quality && (
+                      <div className="absolute bottom-3 right-3 px-2 py-0.5 rounded bg-slate-950/85 text-[10px] font-mono text-emerald-300 border border-emerald-500/30">
+                        {activeItem.quality.score}% SSIM
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ) : viewMode === 'side-by-side' ? (
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4 w-full max-w-5xl items-center">
                   <div className="relative rounded-xl overflow-hidden border border-slate-300 dark:border-slate-800 bg-slate-900 shadow-md">
                     <img
@@ -2869,6 +3142,7 @@ export default function App() {
                     onPointerDown={handleCanvasPointerDown}
                     onPointerMove={handleCanvasPointerMove}
                     onPointerUp={handleCanvasPointerUp}
+                    onPointerLeave={() => setCanvasHoverCoords(null)}
                     className={`max-w-full max-h-[68vh] w-auto h-auto object-contain select-none touch-none ${
                       activeTool === 'compare'
                         ? 'cursor-ew-resize'
@@ -2928,7 +3202,7 @@ export default function App() {
           </div>
 
           {/* Bottom Split Position Slider for fine control */}
-          {activeItem && viewMode === 'compare' && (
+          {activeItem && viewMode === 'compare' && !showBeforeAfterView && (
             <div className="px-6 py-3 bg-white dark:bg-slate-900 border-t border-slate-200 dark:border-slate-800 flex items-center gap-4">
               <span className="text-xs font-medium text-slate-500 dark:text-slate-400 whitespace-nowrap shrink-0">
                 Before / After Split Curtain
