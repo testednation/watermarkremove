@@ -1055,3 +1055,463 @@ export async function removeWatermarkAsync(
   };
 }
 
+export interface WatermarkConfidenceMap {
+  scores: Float32Array; // 0.0 to 1.0 per pixel
+  width: number;
+  height: number;
+  peakConfidence: number; // 0 to 100
+  meanDetectedConfidence: number; // 0 to 100 across pixels >= 0.35
+  highConfidencePercent: number; // % of pixels >= 0.70
+  moderateConfidencePercent: number; // % of pixels in [0.35, 0.70)
+  modelMode: DetectionMode;
+}
+
+function clamp01(v: number): number {
+  return v <= 0 ? 0 : v >= 1 ? 1 : v;
+}
+
+function smoothBoxBlurFloat(
+  src: Float32Array,
+  width: number,
+  height: number,
+  radius: number
+): Float32Array {
+  const r = Math.max(1, Math.min(18, Math.round(radius)));
+  const horiz = new Float32Array(width * height);
+  const out = new Float32Array(width * height);
+
+  // Horizontal sliding window sum
+  for (let y = 0; y < height; y++) {
+    const row = y * width;
+    let sum = 0;
+    let count = 0;
+    for (let x = 0; x <= Math.min(width - 1, r); x++) {
+      sum += src[row + x];
+      count++;
+    }
+    for (let x = 0; x < width; x++) {
+      horiz[row + x] = sum / Math.max(1, count);
+      const nextRight = x + r + 1;
+      if (nextRight < width) {
+        sum += src[row + nextRight];
+        count++;
+      }
+      const prevLeft = x - r;
+      if (prevLeft >= 0) {
+        sum -= src[row + prevLeft];
+        count--;
+      }
+    }
+  }
+
+  // Vertical sliding window sum
+  for (let x = 0; x < width; x++) {
+    let sum = 0;
+    let count = 0;
+    for (let y = 0; y <= Math.min(height - 1, r); y++) {
+      sum += horiz[y * width + x];
+      count++;
+    }
+    for (let y = 0; y < height; y++) {
+      out[y * width + x] = sum / Math.max(1, count);
+      const nextBottom = y + r + 1;
+      if (nextBottom < height) {
+        sum += horiz[nextBottom * width + x];
+        count++;
+      }
+      const prevTop = y - r;
+      if (prevTop >= 0) {
+        sum -= horiz[prevTop * width + x];
+        count--;
+      }
+    }
+  }
+
+  return out;
+}
+
+/**
+ * Computes a continuous per-pixel watermark detection confidence map (0.0 to 1.0)
+ * using the active detection model parameters (mode, sensitivity, target corners,
+ * text/logo toggles) and optional active mask confirmation.
+ */
+export function computeWatermarkConfidenceMap(
+  imageData: ImageData,
+  options: AutoDetectOptions,
+  activeMask?: Uint8Array
+): WatermarkConfidenceMap {
+  const { width, height, data } = imageData;
+  const totalPixels = width * height;
+  const rawScores = new Float32Array(totalPixels);
+
+  if (options.removeText || options.removeLogo) {
+    const luma = new Float32Array(totalPixels);
+    const sat = new Float32Array(totalPixels);
+    const warmStampScore = new Float32Array(totalPixels);
+
+    for (let i = 0; i < totalPixels; i++) {
+      const r = data[i * 4];
+      const g = data[i * 4 + 1];
+      const b = data[i * 4 + 2];
+      luma[i] = 0.299 * r + 0.587 * g + 0.114 * b;
+      const maxC = Math.max(r, g, b);
+      const minC = Math.min(r, g, b);
+      sat[i] = maxC - minC;
+      if (r > 165 && g > 55 && g < 235 && b < 115 && r - b > 85) {
+        warmStampScore[i] = (r - b) * 0.85;
+      }
+    }
+
+    const integralLuma = buildIntegralImage(luma, width, height);
+    const integralSat = buildIntegralImage(sat, width, height);
+
+    const grad = new Float32Array(totalPixels);
+    for (let y = 1; y < height - 1; y++) {
+      const row = y * width;
+      for (let x = 1; x < width - 1; x++) {
+        const idx = row + x;
+        const gx =
+          -luma[idx - width - 1] +
+          luma[idx - width + 1] -
+          2 * luma[idx - 1] +
+          2 * luma[idx + 1] -
+          luma[idx + width - 1] +
+          luma[idx + width + 1];
+        const gy =
+          -luma[idx - width - 1] -
+          2 * luma[idx - width] -
+          luma[idx - width + 1] +
+          luma[idx + width - 1] +
+          2 * luma[idx + width] +
+          luma[idx + width + 1];
+        grad[idx] = Math.hypot(gx, gy);
+      }
+    }
+
+    const integralGrad = buildIntegralImage(grad, width, height);
+    const sensFactor = (105 - Math.max(10, Math.min(95, options.sensitivity))) / 50;
+    const localRadius = Math.max(14, Math.round(Math.min(width, height) * 0.025));
+
+    for (let y = 2; y < height - 2; y++) {
+      const ny = y / height;
+      const row = y * width;
+
+      for (let x = 2; x < width - 2; x++) {
+        const nx = x / width;
+        const idx = row + x;
+
+        const inBottomRight = nx >= 0.58 && ny >= 0.72;
+        const inBottomLeft = nx <= 0.42 && ny >= 0.72;
+        const inTopRight = nx >= 0.62 && ny <= 0.25;
+        const inTopLeft = nx <= 0.38 && ny <= 0.25;
+        const inBottomBar = ny >= 0.84;
+        const inAnyCorner = inBottomRight || inBottomLeft || inTopRight || inTopLeft;
+
+        let zoneAllowed = false;
+        let zoneBoost = 1.0;
+
+        if (options.mode === 'corner-stamp') {
+          if (
+            (inBottomRight && options.targetCorners.bottomRight) ||
+            (inBottomLeft && options.targetCorners.bottomLeft) ||
+            (inTopRight && options.targetCorners.topRight) ||
+            (inTopLeft && options.targetCorners.topLeft) ||
+            inBottomBar
+          ) {
+            zoneAllowed = true;
+            zoneBoost = 1.35;
+          }
+        } else if (options.mode === 'diagonal-tiled') {
+          zoneAllowed = true;
+          zoneBoost = 1.15;
+        } else if (options.mode === 'luminance-key') {
+          zoneAllowed = true;
+          zoneBoost = 1.2;
+        } else {
+          if (
+            (inBottomRight && options.targetCorners.bottomRight) ||
+            (inBottomLeft && options.targetCorners.bottomLeft) ||
+            (inTopRight && options.targetCorners.topRight) ||
+            (inTopLeft && options.targetCorners.topLeft)
+          ) {
+            zoneAllowed = true;
+            zoneBoost = 1.45;
+          } else if (options.targetCorners.centerAndTiled) {
+            zoneAllowed = true;
+            zoneBoost = 0.94;
+          }
+        }
+
+        if (!zoneAllowed) continue;
+
+        const localMean = getBoxMean(integralLuma, width, height, x, y, localRadius);
+        const tightMean = getBoxMean(integralLuma, width, height, x, y, 4);
+        const localGradDensity = getBoxMean(integralGrad, width, height, x, y, 7);
+        const localSatMean = getBoxMean(integralSat, width, height, x, y, localRadius);
+        const pixelLuma = luma[idx];
+        const lumaDiff = pixelLuma - localMean;
+
+        let score = 0;
+
+        // 1. Warm timestamp / colored emblem score
+        if (warmStampScore[idx] > 0) {
+          const wRatio = clamp01(warmStampScore[idx] / Math.max(1, 95 * sensFactor));
+          const gRatio = clamp01(localGradDensity / 24);
+          score = Math.max(score, wRatio * (0.45 + 0.55 * gRatio));
+        }
+
+        // 2. Corner multi-color graphic logo anomaly
+        if (options.removeLogo && inAnyCorner) {
+          const satDelta = sat[idx] - localSatMean;
+          if (satDelta > 14 * sensFactor) {
+            const sRatio = clamp01(satDelta / Math.max(1, 52 * sensFactor));
+            const gRatio = clamp01(localGradDensity / Math.max(1, 32 * sensFactor));
+            score = Math.max(score, sRatio * (0.35 + 0.65 * gRatio));
+          }
+        }
+
+        // Neutrality weight: 1.0 when low saturation or very bright/dark, smooth falloff otherwise
+        const neutralWeight =
+          sat[idx] < 52 || pixelLuma > 212 || pixelLuma < 38
+            ? 1.0
+            : clamp01(1 - (sat[idx] - 52) / 60);
+
+        if (options.mode === 'luminance-key') {
+          if (lumaDiff > 8 * sensFactor && pixelLuma > 130) {
+            const diffRatio = clamp01(lumaDiff / Math.max(1, 32 * sensFactor));
+            const lumaRatio = clamp01((pixelLuma - 130) / 70);
+            const gradRatio = clamp01(localGradDensity / Math.max(1, 30 * sensFactor));
+            const lkScore = diffRatio * lumaRatio * (0.35 + 0.65 * gradRatio) * neutralWeight;
+            score = Math.max(score, lkScore);
+          }
+        } else {
+          // 3. Bright semi-transparent watermark contrast + stroke energy
+          const brightThresh = (21 * sensFactor) / zoneBoost;
+          if (lumaDiff > brightThresh * 0.4 && pixelLuma > 118) {
+            const diffRatio = clamp01(lumaDiff / Math.max(1, brightThresh * 1.45));
+            const lumaRatio = clamp01((pixelLuma - 118) / 68);
+            const strokeA = clamp01(grad[idx] / Math.max(1, 48 * sensFactor));
+            const strokeB =
+              clamp01((tightMean - localMean) / Math.max(1, 21 * sensFactor)) *
+              clamp01(localGradDensity / Math.max(1, 38 * sensFactor));
+            const strokeScore = Math.max(strokeA, strokeB);
+            const brightScore = diffRatio * lumaRatio * (0.3 + 0.7 * strokeScore) * neutralWeight;
+            score = Math.max(score, brightScore);
+          }
+
+          // 4. Dark semi-transparent watermark contrast + stroke energy
+          const darkThresh = (27 * sensFactor) / zoneBoost;
+          if (lumaDiff < -darkThresh * 0.45 && pixelLuma < 115 && localMean > 105) {
+            const diffRatio = clamp01(-lumaDiff / Math.max(1, darkThresh * 1.4));
+            const darkRatio = clamp01((115 - pixelLuma) / 68);
+            const bgRatio = clamp01((localMean - 105) / 50);
+            const gradRatio = clamp01(localGradDensity / Math.max(1, 42 * sensFactor));
+            const darkScore = diffRatio * darkRatio * bgRatio * (0.3 + 0.7 * gradRatio) * neutralWeight;
+            score = Math.max(score, darkScore);
+          }
+        }
+
+        // Suppress mild background noise when neither text nor logo matches category preference
+        if (!options.removeText && options.removeLogo && !inAnyCorner && sat[idx] < 36) {
+          score *= 0.35;
+        }
+
+        rawScores[idx] = clamp01(score);
+      }
+    }
+  }
+
+  // Smooth spatial confidence density field so clusters form coherent thermal hotspots
+  const blurRadius = Math.max(3, Math.round(Math.min(width, height) * 0.0075));
+  const smoothField = smoothBoxBlurFloat(rawScores, width, height, blurRadius);
+
+  // Also smooth active mask slightly for feathered confidence halo around confirmed regions
+  let smoothMask: Float32Array | null = null;
+  if (activeMask && activeMask.length === totalPixels) {
+    const maskFloat = new Float32Array(totalPixels);
+    for (let i = 0; i < totalPixels; i++) {
+      if (activeMask[i] > 0) maskFloat[i] = 1;
+    }
+    smoothMask = smoothBoxBlurFloat(maskFloat, width, height, Math.max(2, Math.round(blurRadius * 0.8)));
+  }
+
+  const finalScores = new Float32Array(totalPixels);
+  let peak = 0;
+  let highCount = 0;
+  let modCount = 0;
+  let detectedSum = 0;
+  let detectedCount = 0;
+
+  for (let i = 0; i < totalPixels; i++) {
+    let val = clamp01(rawScores[i] * 0.42 + smoothField[i] * 0.92);
+
+    if (activeMask && activeMask[i] > 0) {
+      // Confirmed watermark mask region: boost into high-confidence thermal zone (0.72 - 1.0)
+      const interiorBoost = smoothMask ? smoothMask[i] * 0.16 : 0.12;
+      val = Math.max(val, clamp01(0.72 + rawScores[i] * 0.16 + interiorBoost));
+    } else if (smoothMask && smoothMask[i] > 0.05) {
+      // Subtle falloff halo directly adjacent to confirmed mask
+      val = Math.max(val, smoothMask[i] * 0.52);
+    }
+
+    // Suppress very faint noise floor so clean regions remain transparent
+    if (val < 0.06) val = 0;
+
+    finalScores[i] = val;
+    if (val > peak) peak = val;
+    if (val >= 0.7) {
+      highCount++;
+      detectedSum += val;
+      detectedCount++;
+    } else if (val >= 0.35) {
+      modCount++;
+      detectedSum += val;
+      detectedCount++;
+    }
+  }
+
+  return {
+    scores: finalScores,
+    width,
+    height,
+    peakConfidence: Math.round(peak * 100),
+    meanDetectedConfidence:
+      detectedCount > 0 ? Math.round((detectedSum / detectedCount) * 100) : 0,
+    highConfidencePercent: Number(((highCount / totalPixels) * 100).toFixed(2)),
+    moderateConfidencePercent: Number(((modCount / totalPixels) * 100).toFixed(2)),
+    modelMode: options.mode,
+  };
+}
+
+// Precomputed 256-entry thermal confidence color lookup table (Indigo -> Blue -> Cyan -> Yellow -> Orange -> Red -> White-Hot)
+const HEATMAP_LUT: Uint8Array = (() => {
+  const stops: Array<[number, number, number, number]> = [
+    [0.0, 24, 24, 96],
+    [0.18, 37, 99, 235],
+    [0.38, 6, 182, 212],
+    [0.58, 250, 204, 21],
+    [0.78, 249, 115, 22],
+    [0.92, 239, 68, 68],
+    [1.0, 255, 241, 242],
+  ];
+  const lut = new Uint8Array(256 * 3);
+  for (let i = 0; i < 256; i++) {
+    const t = i / 255;
+    let s0 = stops[0];
+    let s1 = stops[stops.length - 1];
+    for (let k = 0; k < stops.length - 1; k++) {
+      if (t >= stops[k][0] && t <= stops[k + 1][0]) {
+        s0 = stops[k];
+        s1 = stops[k + 1];
+        break;
+      }
+    }
+    const span = Math.max(1e-5, s1[0] - s0[0]);
+    const localT = (t - s0[0]) / span;
+    lut[i * 3] = Math.round(s0[1] + (s1[1] - s0[1]) * localT);
+    lut[i * 3 + 1] = Math.round(s0[2] + (s1[2] - s0[2]) * localT);
+    lut[i * 3 + 2] = Math.round(s0[3] + (s1[3] - s0[3]) * localT);
+  }
+  return lut;
+})();
+
+/**
+ * Renders the watermark detection confidence map as a thermal heatmap overlay onto a 2D canvas.
+ */
+export function renderConfidenceHeatmap(
+  ctx: CanvasRenderingContext2D,
+  sourceImageData: ImageData,
+  confidenceMap: WatermarkConfidenceMap,
+  options?: {
+    opacity?: number; // 0.25 to 1.0 (default 0.78)
+    showContours?: boolean;
+  }
+): void {
+  const { width, height, data } = sourceImageData;
+  const opacity = Math.max(0.2, Math.min(1.0, options?.opacity ?? 0.78));
+  const showContours = options?.showContours ?? true;
+  const scores = confidenceMap.scores;
+
+  const outImg = ctx.createImageData(width, height);
+  const out = outImg.data;
+  const totalPixels = width * height;
+
+  for (let i = 0; i < totalPixels; i++) {
+    const p = i * 4;
+    const sr = data[p];
+    const sg = data[p + 1];
+    const sb = data[p + 2];
+    const c = scores[i];
+
+    // Slightly desaturate & darken source base so thermal hotspots read with high contrast
+    const luma = 0.299 * sr + 0.587 * sg + 0.114 * sb;
+    const baseR = (sr * 0.55 + luma * 0.45) * 0.62;
+    const baseG = (sg * 0.55 + luma * 0.45) * 0.62;
+    const baseB = (sb * 0.55 + luma * 0.45) * 0.68;
+
+    if (c <= 0.06) {
+      out[p] = Math.round(baseR);
+      out[p + 1] = Math.round(baseG);
+      out[p + 2] = Math.round(baseB);
+      out[p + 3] = 255;
+      continue;
+    }
+
+    const lutIdx = Math.min(255, Math.max(0, Math.round(c * 255))) * 3;
+    const hr = HEATMAP_LUT[lutIdx];
+    const hg = HEATMAP_LUT[lutIdx + 1];
+    const hb = HEATMAP_LUT[lutIdx + 2];
+
+    const alpha = Math.min(0.92, opacity * Math.pow(c, 0.72));
+    const inv = 1 - alpha;
+
+    out[p] = Math.min(255, Math.round(baseR * inv + hr * alpha));
+    out[p + 1] = Math.min(255, Math.round(baseG * inv + hg * alpha));
+    out[p + 2] = Math.min(255, Math.round(baseB * inv + hb * alpha));
+    out[p + 3] = 255;
+  }
+
+  // Draw crisp iso-confidence contour line at the 68% high-confidence boundary
+  if (showContours) {
+    const contourThresh = 0.68;
+    for (let y = 1; y < height - 1; y++) {
+      const row = y * width;
+      for (let x = 1; x < width - 1; x++) {
+        const idx = row + x;
+        if (scores[idx] >= contourThresh) {
+          const isEdge =
+            scores[idx - 1] < contourThresh ||
+            scores[idx + 1] < contourThresh ||
+            scores[idx - width] < contourThresh ||
+            scores[idx + width] < contourThresh;
+          if (isEdge) {
+            const p = idx * 4;
+            out[p] = Math.min(255, Math.round(out[p] * 0.3 + 255 * 0.7));
+            out[p + 1] = Math.min(255, Math.round(out[p + 1] * 0.3 + 250 * 0.7));
+            out[p + 2] = Math.min(255, Math.round(out[p + 2] * 0.3 + 160 * 0.7));
+          }
+        }
+      }
+    }
+  }
+
+  ctx.putImageData(outImg, 0, 0);
+}
+
+/**
+ * Generates a PNG data URL of the rendered watermark confidence heatmap (used by Simple Mode).
+ */
+export function createConfidenceHeatmapDataUrl(
+  sourceImageData: ImageData,
+  confidenceMap: WatermarkConfidenceMap,
+  opacity: number = 0.78
+): string {
+  const c = document.createElement('canvas');
+  c.width = sourceImageData.width;
+  c.height = sourceImageData.height;
+  const ctx = c.getContext('2d')!;
+  renderConfidenceHeatmap(ctx, sourceImageData, confidenceMap, { opacity, showContours: true });
+  return c.toDataURL('image/png');
+}
+
+

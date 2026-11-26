@@ -37,6 +37,7 @@ import {
   FileDown,
   Cpu,
   Grid3x3,
+  Flame,
 } from 'lucide-react';
 import JSZip from 'jszip';
 import {
@@ -46,6 +47,9 @@ import {
   dilateMask,
   magicWandMask,
   extractDetectionZones,
+  computeWatermarkConfidenceMap,
+  renderConfidenceHeatmap,
+  createConfidenceHeatmapDataUrl,
   DetectionMode,
   InpaintMethod,
   DetectionZone,
@@ -85,7 +89,7 @@ import {
   getQualityBadgeStyles,
 } from './lib/qualityMetrics';
 
-type ViewMode = 'compare' | 'side-by-side' | 'clean' | 'mask' | 'edge-noise' | 'original';
+type ViewMode = 'compare' | 'side-by-side' | 'clean' | 'mask' | 'heatmap' | 'edge-noise' | 'original';
 type ActiveTool = 'compare' | 'brush-add' | 'brush-erase' | 'rect-add' | 'magic-wand';
 
 interface BatchProgress {
@@ -171,6 +175,14 @@ export default function App() {
   const [comparePosition, setComparePosition] = useState<number>(52);
   const [showZoneBoxes, setShowZoneBoxes] = useState<boolean>(true);
   const [showEdgeNoiseOverlay, setShowEdgeNoiseOverlay] = useState<boolean>(false);
+  const [heatmapOpacity, setHeatmapOpacity] = useState<number>(0.78);
+  const [showHeatmapContours, setShowHeatmapContours] = useState<boolean>(true);
+  const [hoveredHeatmapSample, setHoveredHeatmapSample] = useState<{
+    x: number;
+    y: number;
+    confidence: number;
+  } | null>(null);
+  const [simpleHeatmapActive, setSimpleHeatmapActive] = useState<boolean>(false);
   const [showAlignmentGuides, setShowAlignmentGuides] = useState<boolean>(false);
   const [alignmentGuideStyle, setAlignmentGuideStyle] = useState<
     'thirds-center' | 'fine-grid' | 'diagonal-proof'
@@ -262,6 +274,43 @@ export default function App() {
     if (!activeItem) return null;
     return analyzeAutoCropMargins(activeItem.originalData, activeItem.zones);
   }, [activeItem]);
+
+  // Compute continuous detection confidence map lazily when Heatmap view is active
+  const confidenceMap = useMemo(() => {
+    if (!activeItem) return null;
+    const isHeatmapNeeded =
+      (!isSimpleMode && viewMode === 'heatmap') || (isSimpleMode && simpleHeatmapActive);
+    if (!isHeatmapNeeded) return null;
+    return computeWatermarkConfidenceMap(
+      activeItem.originalData,
+      {
+        mode: detectionMode,
+        sensitivity,
+        dilationRadius,
+        removeText,
+        removeLogo,
+        targetCorners,
+      },
+      activeItem.mask
+    );
+  }, [
+    activeItem,
+    isSimpleMode,
+    viewMode,
+    simpleHeatmapActive,
+    detectionMode,
+    sensitivity,
+    dilationRadius,
+    removeText,
+    removeLogo,
+    targetCorners,
+  ]);
+
+  // Pre-rendered PNG data URL for Simple Mode's Confidence Heatmap view
+  const simpleHeatmapUrl = useMemo(() => {
+    if (!isSimpleMode || !simpleHeatmapActive || !activeItem || !confidenceMap) return null;
+    return createConfidenceHeatmapDataUrl(activeItem.originalData, confidenceMap, heatmapOpacity);
+  }, [isSimpleMode, simpleHeatmapActive, activeItem, confidenceMap, heatmapOpacity]);
 
   // Open Bulk Crop modal pre-populated with suggested Auto-Crop non-content margin parameters
   const handleSuggestAutoCrop = useCallback(() => {
@@ -1259,6 +1308,12 @@ export default function App() {
         setShowBeforeAfterView((prev) => !prev);
         return;
       }
+      if (!e.metaKey && !e.ctrlKey && !e.altKey && e.key.toLowerCase() === 'h') {
+        e.preventDefault();
+        setShowBeforeAfterView(false);
+        setViewMode((prev) => (prev === 'heatmap' ? 'compare' : 'heatmap'));
+        return;
+      }
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'z') {
         e.preventDefault();
         if (e.shiftKey) {
@@ -1367,6 +1422,15 @@ export default function App() {
         }
       }
       ctx.putImageData(overlay, 0, 0);
+    } else if (effectiveMode === 'heatmap') {
+      if (confidenceMap) {
+        renderConfidenceHeatmap(ctx, activeItem.originalData, confidenceMap, {
+          opacity: heatmapOpacity,
+          showContours: showHeatmapContours,
+        });
+      } else {
+        ctx.drawImage(origCanvas, 0, 0);
+      }
     } else if (effectiveMode === 'edge-noise') {
       ctx.drawImage(origCanvas, 0, 0);
       if (autoCropSuggestion) {
@@ -1395,7 +1459,14 @@ export default function App() {
       );
     }
 
-    if (showZoneBoxes && !isHoldingOriginal && (effectiveMode === 'mask' || effectiveMode === 'compare' || effectiveMode === 'edge-noise')) {
+    if (
+      showZoneBoxes &&
+      !isHoldingOriginal &&
+      (effectiveMode === 'mask' ||
+        effectiveMode === 'compare' ||
+        effectiveMode === 'edge-noise' ||
+        effectiveMode === 'heatmap')
+    ) {
       ctx.save();
       const splitX = effectiveMode === 'compare' ? (comparePosition / 100) * activeItem.width : activeItem.width;
       activeItem.zones.forEach((z) => {
@@ -1559,6 +1630,9 @@ export default function App() {
     alignmentGuideStyle,
     canvasHoverCoords,
     autoCropSuggestion,
+    confidenceMap,
+    heatmapOpacity,
+    showHeatmapContours,
     dragRect,
     isHoldingOriginal,
     isSimpleMode,
@@ -1611,6 +1685,7 @@ export default function App() {
     const { x, y } = getCanvasCoords(e);
 
     if (activeTool === 'compare') {
+      if (viewMode === 'heatmap') return;
       setViewMode('compare');
       setComparePosition(Math.max(0, Math.min(100, (x / activeItem.width) * 100)));
     } else if (activeTool === 'brush-add' || activeTool === 'brush-erase') {
@@ -1630,9 +1705,18 @@ export default function App() {
     if (showAlignmentGuides) {
       setCanvasHoverCoords({ x, y });
     }
+    if (viewMode === 'heatmap' && confidenceMap) {
+      const ix = Math.max(0, Math.min(confidenceMap.width - 1, Math.round(x)));
+      const iy = Math.max(0, Math.min(confidenceMap.height - 1, Math.round(y)));
+      const conf = Math.round(confidenceMap.scores[iy * confidenceMap.width + ix] * 100);
+      setHoveredHeatmapSample({ x: ix, y: iy, confidence: conf });
+    } else if (hoveredHeatmapSample !== null) {
+      setHoveredHeatmapSample(null);
+    }
     if (!isPointerDownRef.current) return;
 
     if (activeTool === 'compare') {
+      if (viewMode === 'heatmap') return;
       setComparePosition(Math.max(0, Math.min(100, (x / activeItem.width) * 100)));
     } else if (activeTool === 'brush-add' || activeTool === 'brush-erase') {
       paintBrushStroke(x, y, activeTool === 'brush-add', false, true);
@@ -2424,6 +2508,22 @@ export default function App() {
           onFormatChange={(fmt) => setOptimizeFormat(fmt)}
           onQualityChange={(q) => setOptimizeQuality(q)}
           savingsPercent={savingsEstimation.savedPercent}
+          detectionMode={detectionMode}
+          sensitivity={sensitivity}
+          confidenceHeatmapUrl={simpleHeatmapUrl}
+          confidenceSummary={
+            confidenceMap
+              ? {
+                  peakConfidence: confidenceMap.peakConfidence,
+                  meanDetectedConfidence: confidenceMap.meanDetectedConfidence,
+                  highConfidencePercent: confidenceMap.highConfidencePercent,
+                  moderateConfidencePercent: confidenceMap.moderateConfidencePercent,
+                }
+              : null
+          }
+          heatmapOpacity={heatmapOpacity}
+          onHeatmapOpacityChange={setHeatmapOpacity}
+          onHeatmapModeActiveChange={setSimpleHeatmapActive}
         />
       ) : (
       <main id="workspace" className="flex-1 grid grid-cols-1 lg:grid-cols-12 min-h-[calc(100vh-110px)]">
@@ -2818,6 +2918,7 @@ export default function App() {
                     { id: 'side-by-side', label: 'Side-by-Side' },
                     { id: 'clean', label: 'Clean Result' },
                     { id: 'mask', label: 'Mask Map' },
+                    { id: 'heatmap', label: 'Heatmap' },
                     { id: 'edge-noise', label: 'Edge Noise' },
                   ] as const
                 ).map((v) => (
@@ -2831,17 +2932,24 @@ export default function App() {
                       !showBeforeAfterView && viewMode === v.id
                         ? v.id === 'edge-noise'
                           ? 'bg-red-600 text-white shadow-xs'
+                          : v.id === 'heatmap'
+                          ? 'bg-orange-600 text-white shadow-xs'
                           : 'bg-white dark:bg-slate-900 text-slate-900 dark:text-white shadow-xs'
                         : v.id === 'edge-noise'
                         ? 'text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/40'
+                        : v.id === 'heatmap'
+                        ? 'text-orange-600 dark:text-orange-400 hover:bg-orange-50 dark:hover:bg-orange-950/40'
                         : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
                     }`}
                     title={
                       v.id === 'edge-noise'
                         ? 'Highlight detected edge noise, border artifacts, and targeted non-content margins in red on the main canvas'
+                        : v.id === 'heatmap'
+                        ? 'Visualize watermark detection confidence as a thermal heatmap overlay based on the current detection model (Shortcut: H)'
                         : undefined
                     }
                   >
+                    {v.id === 'heatmap' && <Flame className="w-3.5 h-3.5" />}
                     {v.id === 'edge-noise' && (
                       <span
                         className={`w-2 h-2 rounded-full ${
@@ -2868,6 +2976,41 @@ export default function App() {
                     Static Before/After Quick Review (non-interactive): Original (Left) vs Cleaned Result (Right). Click Before/After or press B to resume editing.
                   </span>
                 </span>
+              ) : viewMode === 'heatmap' ? (
+                <div className="flex flex-wrap items-center gap-3 text-orange-700 dark:text-orange-300 font-medium">
+                  <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-orange-100 dark:bg-orange-950/80 border border-orange-300 dark:border-orange-800 text-[11px] font-semibold text-orange-700 dark:text-orange-300">
+                    <Flame className="w-3 h-3" />
+                    Confidence Heatmap
+                  </span>
+                  <div className="flex items-center gap-1.5 text-slate-600 dark:text-slate-300 font-normal">
+                    <span>Intensity:</span>
+                    <input
+                      type="range"
+                      min={25}
+                      max={100}
+                      value={Math.round(heatmapOpacity * 100)}
+                      onChange={(e) => setHeatmapOpacity(Number(e.target.value) / 100)}
+                      className="w-20 accent-orange-500 cursor-pointer"
+                    />
+                    <span className="font-mono tabular-nums text-[11px]">
+                      {Math.round(heatmapOpacity * 100)}%
+                    </span>
+                  </div>
+                  <label className="flex items-center gap-1 text-slate-600 dark:text-slate-300 font-normal cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={showHeatmapContours}
+                      onChange={(e) => setShowHeatmapContours(e.target.checked)}
+                      className="rounded border-orange-300 dark:border-orange-700 accent-orange-500"
+                    />
+                    <span>68% Contours</span>
+                  </label>
+                  {confidenceMap && (
+                    <span className="text-[11px] font-mono text-slate-500 dark:text-slate-400 font-normal">
+                      Peak {confidenceMap.peakConfidence}% · High-Conf {confidenceMap.highConfidencePercent}%
+                    </span>
+                  )}
+                </div>
               ) : viewMode === 'edge-noise' ? (
                 <span className="flex flex-wrap items-center gap-2 text-red-700 dark:text-red-300 font-medium">
                   <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-red-100 dark:bg-red-950/80 border border-red-300 dark:border-red-800 text-[11px] font-semibold text-red-700 dark:text-red-300">
@@ -3142,10 +3285,15 @@ export default function App() {
                     onPointerDown={handleCanvasPointerDown}
                     onPointerMove={handleCanvasPointerMove}
                     onPointerUp={handleCanvasPointerUp}
-                    onPointerLeave={() => setCanvasHoverCoords(null)}
+                    onPointerLeave={() => {
+                      setCanvasHoverCoords(null);
+                      setHoveredHeatmapSample(null);
+                    }}
                     className={`max-w-full max-h-[68vh] w-auto h-auto object-contain select-none touch-none ${
-                      activeTool === 'compare'
+                      activeTool === 'compare' && viewMode !== 'heatmap'
                         ? 'cursor-ew-resize'
+                        : viewMode === 'heatmap' && activeTool === 'compare'
+                        ? 'cursor-crosshair'
                         : activeTool === 'rect-add' || activeTool === 'magic-wand'
                         ? 'cursor-crosshair'
                         : 'cursor-cell'
@@ -3161,6 +3309,38 @@ export default function App() {
                         Cleaned (Inpainted)
                       </div>
                     </>
+                  )}
+
+                  {viewMode === 'heatmap' && !isHoldingOriginal && confidenceMap && (
+                    <div className="pointer-events-none absolute bottom-3 left-3 right-3 flex flex-wrap items-center justify-between gap-2 px-3 py-2 rounded-lg bg-slate-950/90 border border-orange-500/45 text-[11px] text-slate-200 shadow-lg">
+                      <div className="flex items-center gap-2.5">
+                        <span className="inline-flex items-center gap-1 font-semibold text-orange-400">
+                          <Flame className="w-3.5 h-3.5" />
+                          Model: {detectionMode}
+                        </span>
+                        <span className="text-slate-400 font-mono text-[10px]">
+                          Sens {sensitivity}%
+                        </span>
+                        {hoveredHeatmapSample && (
+                          <span className="px-1.5 py-0.5 rounded bg-orange-500/20 border border-orange-400/40 font-mono text-[10px] text-orange-200">
+                            ({hoveredHeatmapSample.x}, {hoveredHeatmapSample.y}) · Conf {hoveredHeatmapSample.confidence}%
+                          </span>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <span className="text-[10px] font-mono text-slate-400">0%</span>
+                        <div
+                          className="w-32 sm:w-40 h-2.5 rounded-full border border-slate-700"
+                          style={{
+                            background:
+                              'linear-gradient(90deg, #181860 0%, #2563eb 18%, #06b6d4 38%, #facc15 58%, #f97316 78%, #ef4444 92%, #fff1f2 100%)',
+                          }}
+                        />
+                        <span className="text-[10px] font-mono text-orange-200 font-semibold">
+                          100%
+                        </span>
+                      </div>
+                    </div>
                   )}
 
                   {(viewMode === 'edge-noise' || showEdgeNoiseOverlay) && !isHoldingOriginal && (

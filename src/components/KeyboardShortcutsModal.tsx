@@ -23,6 +23,7 @@ import {
   RotateCcw,
   Grid3x3,
   Columns2,
+  Flame,
 } from 'lucide-react';
 
 interface ShortcutItem {
@@ -108,6 +109,14 @@ const SHORTCUTS: ShortcutItem[] = [
     description: 'Display Original and Cleaned Result side-by-side in a static, non-interactive review view.',
     keys: ['B'],
     icon: <Columns2 className="w-4 h-4 text-blue-500" />,
+  },
+  {
+    id: 'heatmap-toggle',
+    category: 'views',
+    label: 'Toggle Confidence Heatmap',
+    description: 'Visualize watermark detection confidence intensity across the image based on the current detection model.',
+    keys: ['H'],
+    icon: <Flame className="w-4 h-4 text-orange-500" />,
   },
   {
     id: 'mode-switch',

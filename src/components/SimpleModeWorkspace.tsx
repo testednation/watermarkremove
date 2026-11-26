@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   Upload,
   ClipboardPaste,
@@ -23,10 +23,11 @@ import {
   Link2,
   Crop,
   Cpu,
+  Flame,
 } from 'lucide-react';
 import { SamplePreset } from '../lib/sampleGenerator';
 import { ReconstructionQuality, getQualityBadgeStyles } from '../lib/qualityMetrics';
-import { DetectionZone, InpaintMethod } from '../lib/watermarkEngine';
+import { DetectionMode, DetectionZone, InpaintMethod } from '../lib/watermarkEngine';
 import { OptimizeFormat } from '../lib/optimizer';
 import { ExportPresetsDropdown } from './ExportPresetsDropdown';
 
@@ -101,6 +102,18 @@ interface SimpleModeWorkspaceProps {
   onFormatChange: (format: OptimizeFormat) => void;
   onQualityChange: (quality: number) => void;
   savingsPercent: number;
+  detectionMode?: DetectionMode;
+  sensitivity?: number;
+  confidenceHeatmapUrl?: string | null;
+  confidenceSummary?: {
+    peakConfidence: number;
+    meanDetectedConfidence: number;
+    highConfidencePercent: number;
+    moderateConfidencePercent: number;
+  } | null;
+  heatmapOpacity?: number;
+  onHeatmapOpacityChange?: (opacity: number) => void;
+  onHeatmapModeActiveChange?: (active: boolean) => void;
 }
 
 export const SimpleModeWorkspace: React.FC<SimpleModeWorkspaceProps> = ({
@@ -141,9 +154,28 @@ export const SimpleModeWorkspace: React.FC<SimpleModeWorkspaceProps> = ({
   onFormatChange,
   onQualityChange,
   savingsPercent,
+  detectionMode = 'smart-auto',
+  sensitivity = 68,
+  confidenceHeatmapUrl = null,
+  confidenceSummary = null,
+  heatmapOpacity = 0.78,
+  onHeatmapOpacityChange,
+  onHeatmapModeActiveChange,
 }) => {
-  const [previewMode, setPreviewMode] = useState<'side-by-side' | 'split' | 'clean'>('side-by-side');
+  const [previewMode, setPreviewMode] = useState<'side-by-side' | 'split' | 'clean' | 'heatmap'>('side-by-side');
   const [isBeforeAfterStatic, setIsBeforeAfterStatic] = useState<boolean>(false);
+
+  const selectPreviewMode = (nextMode: 'side-by-side' | 'split' | 'clean' | 'heatmap') => {
+    setIsBeforeAfterStatic(false);
+    setPreviewMode(nextMode);
+    onHeatmapModeActiveChange?.(nextMode === 'heatmap');
+  };
+
+  useEffect(() => {
+    return () => {
+      onHeatmapModeActiveChange?.(false);
+    };
+  }, [onHeatmapModeActiveChange]);
   const [splitPos, setSplitPos] = useState<number>(50);
   const [isHoldingOriginal, setIsHoldingOriginal] = useState<boolean>(false);
   const [isPointerDraggingSplit, setIsPointerDraggingSplit] = useState<boolean>(false);
@@ -519,7 +551,12 @@ export const SimpleModeWorkspace: React.FC<SimpleModeWorkspaceProps> = ({
                   type="button"
                   aria-pressed={isBeforeAfterStatic}
                   onClick={() => {
-                    setIsBeforeAfterStatic((prev) => !prev);
+                    setIsBeforeAfterStatic((prev) => {
+                      const next = !prev;
+                      if (next) onHeatmapModeActiveChange?.(false);
+                      else onHeatmapModeActiveChange?.(previewMode === 'heatmap');
+                      return next;
+                    });
                     setHoverLensPos(null);
                     setIsHoldingOriginal(false);
                     setIsPointerDraggingSplit(false);
@@ -536,10 +573,7 @@ export const SimpleModeWorkspace: React.FC<SimpleModeWorkspaceProps> = ({
                 </button>
                 <button
                   type="button"
-                  onClick={() => {
-                    setIsBeforeAfterStatic(false);
-                    setPreviewMode('side-by-side');
-                  }}
+                  onClick={() => selectPreviewMode('side-by-side')}
                   className={`px-3 py-1.5 rounded-xl text-xs font-bold flex items-center gap-1.5 transition-colors cursor-pointer ${
                     !isBeforeAfterStatic && previewMode === 'side-by-side' && !isHoldingOriginal
                       ? 'bg-blue-600 text-white shadow-xs'
@@ -551,10 +585,7 @@ export const SimpleModeWorkspace: React.FC<SimpleModeWorkspaceProps> = ({
                 </button>
                 <button
                   type="button"
-                  onClick={() => {
-                    setIsBeforeAfterStatic(false);
-                    setPreviewMode('split');
-                  }}
+                  onClick={() => selectPreviewMode('split')}
                   className={`px-3 py-1.5 rounded-xl text-xs font-bold flex items-center gap-1.5 transition-colors cursor-pointer ${
                     !isBeforeAfterStatic && previewMode === 'split' && !isHoldingOriginal
                       ? 'bg-blue-600 text-white shadow-xs'
@@ -566,10 +597,7 @@ export const SimpleModeWorkspace: React.FC<SimpleModeWorkspaceProps> = ({
                 </button>
                 <button
                   type="button"
-                  onClick={() => {
-                    setIsBeforeAfterStatic(false);
-                    setPreviewMode('clean');
-                  }}
+                  onClick={() => selectPreviewMode('clean')}
                   className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-colors cursor-pointer ${
                     !isBeforeAfterStatic && previewMode === 'clean' && !isHoldingOriginal
                       ? 'bg-blue-600 text-white shadow-xs'
@@ -577,6 +605,19 @@ export const SimpleModeWorkspace: React.FC<SimpleModeWorkspaceProps> = ({
                   }`}
                 >
                   Clean Result
+                </button>
+                <button
+                  type="button"
+                  onClick={() => selectPreviewMode('heatmap')}
+                  className={`px-3 py-1.5 rounded-xl text-xs font-bold flex items-center gap-1.5 transition-colors cursor-pointer ${
+                    !isBeforeAfterStatic && previewMode === 'heatmap' && !isHoldingOriginal
+                      ? 'bg-orange-600 text-white shadow-xs'
+                      : 'bg-orange-500/10 dark:bg-orange-950/50 text-orange-700 dark:text-orange-300 hover:bg-orange-500/20'
+                  }`}
+                  title="Visualize watermark detection confidence as a thermal heatmap overlay"
+                >
+                  <Flame className="w-3.5 h-3.5" />
+                  <span>Heatmap</span>
                 </button>
 
                 {!isBeforeAfterStatic && previewMode === 'side-by-side' && (
@@ -648,6 +689,61 @@ export const SimpleModeWorkspace: React.FC<SimpleModeWorkspaceProps> = ({
                 <p className="mt-2.5 text-center text-[11px] text-slate-500 dark:text-slate-400">
                   Static Before/After quick review (non-interactive). Click Before/After again to return to interactive views.
                 </p>
+              </div>
+            ) : previewMode === 'heatmap' && !isHoldingOriginal ? (
+              <div className="p-4 md:p-6 space-y-3">
+                <div className="relative rounded-xl overflow-hidden border border-orange-500/40 bg-slate-950 shadow-lg flex items-center justify-center">
+                  <img
+                    src={confidenceHeatmapUrl || activeItem.originalUrl}
+                    alt="Watermark detection confidence heatmap"
+                    className="w-full h-auto max-h-[380px] object-contain mx-auto block select-none"
+                  />
+                  <div className="absolute top-3 left-3 px-2.5 py-1 rounded-md bg-slate-950/90 border border-orange-500/50 text-xs font-bold text-orange-300 flex items-center gap-1.5">
+                    <Flame className="w-3.5 h-3.5 text-orange-400" />
+                    <span>Detection Confidence Heatmap</span>
+                  </div>
+                  {confidenceSummary && (
+                    <div className="absolute top-3 right-3 px-2.5 py-1 rounded-md bg-slate-950/90 border border-slate-700 text-[11px] font-mono text-slate-200">
+                      Peak {confidenceSummary.peakConfidence}% · High {confidenceSummary.highConfidencePercent}%
+                    </div>
+                  )}
+                </div>
+                <div className="flex flex-wrap items-center justify-between gap-3 px-3 py-2 rounded-xl bg-slate-900/90 border border-slate-800 text-xs text-slate-300">
+                  <div className="flex flex-wrap items-center gap-3">
+                    <span className="font-mono text-[11px] text-orange-300 font-semibold">
+                      Model: {detectionMode} ({sensitivity}%)
+                    </span>
+                    {onHeatmapOpacityChange && (
+                      <label className="flex items-center gap-2 text-[11px] text-slate-300">
+                        <span>Intensity:</span>
+                        <input
+                          type="range"
+                          min={25}
+                          max={100}
+                          value={Math.round(heatmapOpacity * 100)}
+                          onChange={(e) => onHeatmapOpacityChange(Number(e.target.value) / 100)}
+                          className="w-24 accent-orange-500 cursor-pointer"
+                        />
+                        <span className="font-mono tabular-nums">
+                          {Math.round(heatmapOpacity * 100)}%
+                        </span>
+                      </label>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span className="text-[10px] font-mono text-slate-400">Low 0%</span>
+                    <div
+                      className="w-36 h-2.5 rounded-full border border-slate-700"
+                      style={{
+                        background:
+                          'linear-gradient(90deg, #181860 0%, #2563eb 18%, #06b6d4 38%, #facc15 58%, #f97316 78%, #ef4444 92%, #fff1f2 100%)',
+                      }}
+                    />
+                    <span className="text-[10px] font-mono text-orange-200 font-semibold">
+                      100% High
+                    </span>
+                  </div>
+                </div>
               </div>
             ) : previewMode === 'side-by-side' && !isHoldingOriginal ? (
               <div className="p-4 md:p-6">
